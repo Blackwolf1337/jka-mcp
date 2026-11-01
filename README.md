@@ -54,7 +54,7 @@ The `prepare` object builds a game folder of its own, so nobody has to test in t
 | Key | Meaning |
 |-----|---------|
 | `link` | List of `[source dir, destination dir under game_dir, glob]`. Each match becomes a symlink. The glob is optional (default `*`). |
-| `copy` | List of `[file, destination relative to game_dir]`. Real copies of the executables, the renderers, the modules and the asset pk3. |
+| `copy` | List of `[file, destination relative to game_dir]`. Real copies of the executables, the renderers, the modules and the asset pk3. A copy gets the mode of its source. A copy whose source is its own destination is refused. |
 
 The `reload` object has these keys. Each kind has a list of build commands (argv lists) and a list of files to put in place.
 
@@ -62,7 +62,7 @@ The `reload` object has these keys. Each kind has a list of build commands (argv
 |-----|---------|
 | `cwd` | Working folder for the build commands. |
 | `menus` | Commands that build the menus. |
-| `menus_copy` | List of `[source dir, destination]`. Every file in a source dir is copied to its destination under `<home>/<fs_game>/` of each running client. |
+| `menus_copy` | List of `[source dir, destination]`. Every file in a source dir is copied to its destination under `<home>/<fs_game>/` of every client of the session (running or not) and of `main`. The dedicated server gets none, it has no menus. |
 | `menus_put` | List of `[built file, destination relative to game_dir]`, e.g. the asset pk3. The game reads it at the next launch. |
 | `modules`, `modules_copy` | Build commands and `[built file, destination relative to game_dir]` for the ui, cgame and game libraries. |
 | `renderer`, `renderer_copy` | The same for the renderer libraries. |
@@ -93,7 +93,7 @@ Most tools take `client` (default `main`) to pick one of several running clients
 | `state` | Game time, own player, view and entities near the view (`v_levelDump`). | `radius` (default 1024), `format` (`concise` or `json`) |
 | `project` | Window pixels of world points (`v_project`), null when behind the view. | `points` |
 | `hold` | Presses buttons for a time of game clock, then lets them go. | `buttons`, `ms` (default 500), `screenshot` |
-| `view` | Puts the player at a place and view without the push of a teleport. Third person camera. | `origin`, `yaw`, `pitch`, `third`, `range`, `angle`, `screenshot` |
+| `view` | Puts the player at a place and view without the push of a teleport unless `still` is false. Yaw and pitch that are not given stay as they are. Third person camera. | `origin`, `yaw`, `pitch`, `still` (default true), `third`, `range`, `angle`, `screenshot` |
 | `audio` | Records the sound and returns loudness and main frequencies per window. | `seconds` (default 2), `window_ms` (default 100), `hold` |
 | `menu_dump` | Open menus and their items: name, type, rect, flags, cvar and value, text. | `filter`, `format`, `decorations` |
 | `mouse` | Moves the menu pointer to window pixels and can click, hold, release or use the wheel. | `x`, `y`, `action`, `screenshot` |
@@ -103,19 +103,21 @@ Most tools take `client` (default `main`) to pick one of several running clients
 | `relaunch` | Restarts a client with the same options, back on its map, place and view. | `client`, `keep` (cvar names to carry over) |
 | `prepare` | Builds `game_dir` from `prepare.link` and `prepare.copy`. | none |
 
-`launch` with `map` starts with `+devmap`, so cheats are on. `connect` takes an address. `localhost` and `local` are mapped to `127.0.0.1:<server_port>` (or the port given after a colon), because the engine reads `localhost` as the server inside its own process. With `map` or `connect` the call returns after the start, use `wait kind=ingame` for the level. `preset` takes names from the config. The cvars of the config, the presets and `cvars` are written to `jkamcp_launch.cfg` in the home folder and the command line execs it, because the engine drops command line words past 32. With `audio=true` the sound goes to a file through the SDL disk driver, and the quiet volumes are not used. With `vk_debug=true` the Vulkan validation layers run, and their messages are lines with `VULKAN` (`log pattern=VULKAN`).
+`launch` with `map` starts with `+devmap`, so cheats are on. `map` and `connect` together are refused. `connect` takes an address. `localhost` and `local` are mapped to `127.0.0.1:<server_port>` (or the port given after a colon), because the engine reads `localhost` as the server inside its own process. With `map` or `connect` the call returns after the start, use `wait kind=ingame` for the level. `preset` takes names from the config. The cvars of the config, the presets and `cvars` are written to `jkamcp_launch.cfg` in the home folder and the command line execs it, because the engine drops command line words past 32. A cvar value with a double quote is refused, a cfg line cannot hold one. The log of a client is cut back when it is over 20 MB, the old one is kept as `.old`. With `audio=true` the sound goes to a file through the SDL disk driver, and the quiet volumes are not used. With `vk_debug=true` the Vulkan validation layers run, and their messages are lines with `VULKAN` (`log pattern=VULKAN`).
 
 `wait` has four kinds. `ingame` waits until the level is loaded and the player plays. With `join` (default true) it sends `team free` again every 3 seconds and closes open menus. `log` waits for a printed line that matches `pattern`. `cvar` waits until the cvar `name` has `value`. `time` waits until the game clock went on by `ms`. The clock is the one of the cgame, not a frame count.
 
+`audio` reads rate, format and channels from the `SDL_AudioSpec` lines of the engine in the log, and refuses anything but `AUDIO_S16LSB` stereo.
+
 `hold`, `sequence` and `audio` take buttons as `+forward` or `forward`, and release them at the end, also after an error. `sequence` projects `around` once at the start.
 
-`view` sends `setviewpos x y z yaw pitch still` and waits up to 3 seconds until the snapshots of the server show the player there. It needs cheats. `third` sets `cg_thirdPerson`, `range` sets `cg_thirdPersonRange`, `angle` sets `cg_thirdPersonAngle`.
+`view` reads the current yaw and pitch from `v_levelDump` for the one that is not given. It sends `setviewpos x y z yaw pitch still` (without `still` when `still` is false) and waits up to 3 seconds until the snapshots of the server show the player there. It needs cheats. `third` sets `cg_thirdPerson`, `range` sets `cg_thirdPersonRange`, `angle` sets `cg_thirdPersonAngle`.
 
 `reload` with `menus` runs the menu build, copies the menu files, puts the pk3 and runs `ui_load`. With `modules` it runs the module build, puts the libraries in place and runs `vid_restart`. `renderer` does the same with the renderer libraries. With `engine` the clients are relaunched like `relaunch` does. If no client runs, only the build and copy steps happen.
 
 `relaunch` keeps the map, the place and the view, and the cvars named in `keep`, which are set again after the level loads.
 
-`prepare` refuses to run while a client or the server runs, refuses `/tmp`, and refuses a `game_dir` inside a link source folder. It never writes into the source folders.
+`prepare` refuses to run while a client or the server runs, refuses `/tmp`, and refuses a `game_dir` inside a link source folder. It never writes into the source folders. It writes `jkamcp_prepared.json` in `game_dir`, a list of what it made. On the next run it removes only the files and links from that list that the config no longer names. It never removes anything else.
 
 ## Example
 

@@ -138,7 +138,11 @@ class Game:
     def _launch_cfg(self, cvars):
         """The cvars of a launch go into a cfg that the command line execs: the engine takes at most 32 + commands from
         the command line and drops the rest without a word."""
-        text = ''.join('set %s "%s"\n' % (k, str(v).replace('"', '')) for k, v in cvars.items())
+        for k, v in cvars.items():
+            if '"' in str(v) or '"' in k or ';' in k or not k:
+                # (a cfg line has no way to put a double quote into a value)
+                raise RuntimeError('cvar %s: a value may not contain a double quote: %r' % (k, v))
+        text = ''.join('set %s "%s"\n' % (k, v) for k, v in cvars.items())
         for folder in ('base', self.cfg['fs_game']):
             os.makedirs(os.path.join(self.home, folder), exist_ok=True)
             with open(os.path.join(self.home, folder, 'jkamcp_launch.cfg'), 'w', encoding='utf-8') as f:
@@ -155,6 +159,8 @@ class Game:
         not_temporary(game_dir, 'game_dir')
         not_temporary(self.home, 'home')
         os.makedirs(os.path.join(self.home, cfg['fs_game']), exist_ok=True)
+        if opts.get('map') and opts.get('connect'):
+            raise RuntimeError('map= starts a level of its own, connect= joins a server: give one of them')
         self.opts = dict(opts)
         width, height = int(opts.get('width', 1920)), int(opts.get('height', 1080))
         cvars = {} if self.server else dict(cfg.get('cvars') or {})
@@ -216,6 +222,9 @@ class Game:
             log_file = os.path.join(self.home, 'jka-mcp.log')
         if log_file:
             os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            # (appended from launch to launch; past 20 MB it starts again, the old one kept as .old)
+            if os.path.exists(log_file) and os.path.getsize(log_file) > LOG_MAX:
+                os.replace(log_file, log_file + '.old')
         self.log = open(log_file, 'a', encoding='utf-8', errors='replace') if log_file else None
         with self.cond:
             self.lines.clear()
@@ -483,6 +492,7 @@ class Game:
 
 
 GAMES = {}          # the clients by name, and the server under '#server'
+LOG_MAX = 20 * 1024 * 1024
 
 
 def game_of(cfg, a, create=False, server=False):
@@ -725,10 +735,11 @@ TOOLS = [
      'inputSchema': schema(dict(CLIENT, buttons=P(type='array', items=P(type='string')), ms=P(type='integer', default=500), **SHOT), ['buttons']),
      'annotations': ACT},
     {'name': 'view', 'title': 'Place the player',
-     'description': 'Put the player at origin [x,y,z] looking at yaw (and pitch), without the push of a teleport (setviewpos '
-                    '... still; needs cheats, e.g. launch map=). third: third person on/off, range/angle for its camera.',
-     'inputSchema': schema(dict(CLIENT, origin=P(type='array', items=P(type='number')), yaw=P(type='number', default=0),
-                                pitch=P(type='number', default=0), third=P(type='boolean'), range=P(type='number'),
+     'description': 'Put the player at origin [x,y,z] looking at yaw and pitch (what is not given stays), without the push of '
+                    'a teleport unless still=false (setviewpos; needs cheats, e.g. launch map=). third: third person on/off, '
+                    'range/angle for its camera.',
+     'inputSchema': schema(dict(CLIENT, origin=P(type='array', items=P(type='number')), yaw=P(type='number'),
+                                pitch=P(type='number'), still=P(type='boolean', default=True), third=P(type='boolean'), range=P(type='number'),
                                 angle=P(type='number'), **SHOT)),
      'annotations': ACT},
     {'name': 'audio', 'title': 'Record the sound',
@@ -906,9 +917,12 @@ def do_reload(cfg, what):
         pairs = r.get('menus_copy') or []
         if pairs and isinstance(pairs[0], str):
             pairs = [pairs]     # (one [source, destination] or a list of them)
-        for g in clients or [Game(cfg)]:
+        # (into the home of every client of this session, running or not, and of main: the server has no menus)
+        homes = {g.home: g for g in GAMES.values() if not g.server}
+        homes.setdefault(Game(cfg).home, None)
+        for home in homes:
             for src, dst in pairs:
-                dst = os.path.join(g.home, cfg['fs_game'], dst)
+                dst = os.path.join(home, cfg['fs_game'], dst)
                 n = 0
                 for root, _, files in os.walk(src):
                     for f in files:
@@ -967,9 +981,9 @@ def relaunch(cfg, game, keep):
     return '; '.join(msg)
 
 
-def place_player(game, origin, yaw, pitch, timeout=3.0):
-    """setviewpos without the push of a teleport, and wait until the snapshots of the server show the player there."""
-    lines = game.command('setviewpos %g %g %g %g %g still' % (origin[0], origin[1], origin[2], yaw, pitch), 0.2)
+def place_player(game, origin, yaw, pitch, timeout=3.0, still=True):
+    """setviewpos (still: without the push of a teleport), and wait until the snapshots of the server show the player there."""
+    lines = game.command('setviewpos %g %g %g %g %g%s' % (origin[0], origin[1], origin[2], yaw, pitch, ' still' if still else ''), 0.2)
     bad = [line for line in lines if 'usage' in line.lower() or 'cheat' in line.lower()]
     if bad:
         raise RuntimeError('setviewpos: ' + ' | '.join(bad) + ' (cheats: launch with map=, or sv_cheats 1 on the server)')
@@ -980,6 +994,9 @@ def place_player(game, origin, yaw, pitch, timeout=3.0):
             return 'at %g %g %g, yaw %g pitch %g' % (origin[0], origin[1], origin[2], yaw, pitch)
         time.sleep(0.05)
     return 'sent the player to %g %g %g (not there after %gs: blocked, or falling)' % (origin[0], origin[1], origin[2], timeout)
+
+
+MANIFEST = 'jkamcp_prepared.json'   # in game_dir: the files prepare made there, the only ones it removes
 
 
 def prepare(cfg):
@@ -994,6 +1011,7 @@ def prepare(cfg):
             raise RuntimeError('game_dir %s is inside the source folder %s: prepare never writes there' % (game_dir, s))
     out = []
     n = 0
+    made = []       # what prepare puts into game_dir, relative: the files of an earlier prepare that are no longer wanted go
     for entry in p.get('link') or []:
         src, dst = entry[0], entry[1]
         pattern = entry[2] if len(entry) > 2 else '*'
@@ -1001,18 +1019,41 @@ def prepare(cfg):
         os.makedirs(dst, exist_ok=True)
         for f in sorted(glob.glob(os.path.join(src, pattern))):
             link = os.path.join(dst, os.path.basename(f))
+            made.append(os.path.relpath(link, game_dir))
             if os.path.islink(link) and os.path.realpath(link) == os.path.realpath(f):
                 continue
             if os.path.lexists(link):
                 os.remove(link)
             os.symlink(os.path.abspath(f), link)
             n += 1
-    out.append('%d links' % n)
+    out.append('%d new links' % n)
     for src, dst in p.get('copy') or []:
-        put_file(src, os.path.join(game_dir, dst))
-        if os.access(src, os.X_OK):
-            os.chmod(os.path.join(game_dir, dst), os.stat(src).st_mode)
+        target = os.path.join(game_dir, dst)
+        if os.path.realpath(src) == os.path.realpath(target):
+            raise RuntimeError('prepare.copy: %s is its own destination' % src)
+        put_file(src, target)
+        # (the mode as the source has it: an executable stays one)
+        os.chmod(target, os.stat(src).st_mode & 0o7777)
+        made.append(os.path.normpath(dst))
         out.append('copied %s' % dst)
+    manifest = os.path.join(game_dir, MANIFEST)
+    old = []
+    if os.path.exists(manifest):
+        with open(manifest, encoding='utf-8') as f:
+            old = json.load(f)
+    gone = []
+    for rel in old:
+        path = os.path.join(game_dir, rel)
+        # (only what an earlier prepare made, inside game_dir, and only links or files)
+        if rel in made or os.path.isabs(rel) or rel.startswith('..'):
+            continue
+        if os.path.islink(path) or os.path.isfile(path):
+            os.remove(path)
+            gone.append(rel)
+    with open(manifest, 'w', encoding='utf-8') as f:
+        json.dump(sorted(set(made)), f, indent=1)
+    if gone:
+        out.append('removed %d from an earlier prepare: %s' % (len(gone), ', '.join(gone)))
     return 'prepared %s: %s' % (game_dir, ', '.join(out))
 
 
@@ -1136,7 +1177,13 @@ def call(cfg, name, a):
         g = game_of(cfg, a)
         msg = []
         if a.get('origin'):
-            msg.append(place_player(g, a['origin'], float(a.get('yaw', 0)), float(a.get('pitch', 0))))
+            yaw, pitch = a.get('yaw'), a.get('pitch')
+            if yaw is None or pitch is None:
+                # (what is not given stays as it is)
+                ang = g.level(0)['player']['angles']
+                yaw = ang[1] if yaw is None else yaw
+                pitch = ang[0] if pitch is None else pitch
+            msg.append(place_player(g, a['origin'], float(yaw), float(pitch), still=a.get('still', True)))
         cmds = []
         if a.get('third') is not None:
             cmds.append('cg_thirdPerson %d' % (1 if a['third'] else 0))
@@ -1152,11 +1199,22 @@ def call(cfg, name, a):
         g = game_of(cfg, a)
         if not g.audio_path:
             raise RuntimeError('launch the client with audio=true first')
-        rate = 44100
+        # the format of the device, as the engine printed it when its sound started (SDL_AudioSpec)
+        rate, fmt, channels = None, None, None
         for line in list(g.lines):
             m = re.search(r'Freq:\s+(\d+)', line)
             if m:
                 rate = int(m.group(1))
+            m = re.search(r'Format:\s+(\S+)', line)
+            if m:
+                fmt = m.group(1)
+            m = re.search(r'Channels:\s+(\d+)', line)
+            if m:
+                channels = int(m.group(1))
+        if rate is None or fmt is None or channels is None:
+            raise RuntimeError('the engine printed no format of its sound device (SDL_AudioSpec) yet')
+        if fmt != 'AUDIO_S16LSB' or channels != 2:
+            raise RuntimeError('the sound device is %s with %d channels; the analysis reads AUDIO_S16LSB stereo' % (fmt, channels))
         start = os.path.getsize(g.audio_path) if os.path.exists(g.audio_path) else 0
         if a.get('hold'):
             press(g, a['hold'], True)
