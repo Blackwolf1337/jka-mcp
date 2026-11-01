@@ -46,7 +46,8 @@ CONFIG = {
     'reload': {                     # what reload runs; each a list of commands (argv lists), run in 'cwd'
         'cwd': '',
         'menus': [],                # e.g. [["python3", "tools/menus/build.py"]]
-        'menus_copy': [],           # [source dir, destination under home/<fs_game>]: loose files the game reads first
+        'menus_copy': [],           # [[source dir, destination under home/<fs_game>], ...]: loose files the game reads first
+        'menus_put': [],            # [[built file, destination relative to game_dir], ...], e.g. the asset pk3
         'modules': [],              # e.g. [["ninja", "-C", "build64", "uix86_64.so", "cgamex86_64.so"]]
         'modules_copy': [],         # [[built file, destination relative to game_dir], ...]
     },
@@ -514,8 +515,10 @@ def call(game, cfg, name, a):
         out = []
         if a['what'] == 'menus':
             out.append(run_commands(cfg, r.get('menus') or []))
-            if r.get('menus_copy'):
-                src, dst = r['menus_copy']
+            pairs = r.get('menus_copy') or []
+            if pairs and isinstance(pairs[0], str):
+                pairs = [pairs]     # (one [source, destination] or a list of them)
+            for src, dst in pairs:
                 dst = os.path.join(os.path.abspath(cfg['home']), cfg['fs_game'], dst)
                 n = 0
                 for root, _, files in os.walk(src):
@@ -524,6 +527,9 @@ def call(game, cfg, name, a):
                         put_file(os.path.join(root, f), os.path.join(dst, rel))
                         n += 1
                 out.append('copied %d files to %s' % (n, dst))
+            for src, dst in r.get('menus_put') or []:
+                put_file(src, os.path.join(os.path.abspath(cfg['game_dir']), dst))
+                out.append('put %s (read at the next launch)' % dst)
             if game.running():
                 out.append('\n'.join(game.command('ui_load', 2.0)[-20:]))
         else:

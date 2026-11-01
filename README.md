@@ -42,7 +42,8 @@ The `reload` object has these keys.
 |-----|---------|
 | `cwd` | Working folder for the build commands. |
 | `menus` | List of commands (each an argv list) that build the menus. |
-| `menus_copy` | `[source dir, destination]`. Every file in the source dir is copied to the destination under `<home>/<fs_game>/`. |
+| `menus_copy` | List of `[source dir, destination]`. Every file in a source dir is copied to its destination under `<home>/<fs_game>/`. |
+| `menus_put` | List of `[built file, destination relative to game_dir]`, e.g. the asset pk3. The game reads it at the next launch. |
 | `modules` | List of commands (each an argv list) that build the modules. |
 | `modules_copy` | List of `[built file, destination relative to game_dir]`. |
 
