@@ -1,17 +1,23 @@
 # jka-mcp
 
-An MCP server that runs Jedi Knight: Jedi Academy multiplayer clients based on OpenJK without a window, so an AI coding assistant can test menus. It was made for VisionJK. The game starts in the headless backend of gamescope with `SDL_AUDIODRIVER=dummy`. The assistant can send console commands, take screenshots, read a dump of the open menus with the rectangles of their items in window pixels, move the mouse, press keys, and rebuild menus or modules and load them into the running game.
+An MCP server that runs Jedi Knight: Jedi Academy multiplayer clients based on OpenJK without a window, so an AI coding assistant can test them. It was made for VisionJK. Version 0.2 tests menus and gameplay. The assistant can start several named clients and a local dedicated server, send console commands, press buttons for a time measured by the game clock, place the player, read a dump of the level, project world points to the screen, take cropped, zoomed and timed screenshots, record and measure the sound, read a dump of the open menus, move the mouse, press keys, and rebuild menus, modules, the renderer or the engine and load them into the running game.
 
-The server talks MCP over stdio. It uses only the Python standard library. Pillow is optional: with it, screenshots are scaled down and sent as JPEG, without it they are sent as PNG.
+Clients start in the headless backend of gamescope. The server talks MCP over stdio. It uses only the Python standard library. Pillow and numpy are optional, see Requirements.
 
 ## Requirements
 
 - Linux
 - Python 3.8 or newer
 - gamescope (only for the `gamescope` launcher)
-- a game install with an OpenJK or VisionJK client
+- a game install with an OpenJK or VisionJK client, or a folder that `prepare` builds
+- Pillow for `crop`, `zoom`, `sequence` and `compare`. Without it screenshots are sent as PNG at full size.
+- numpy for the `audio` tool
 
-`menu_dump`, `mouse`, `click` and `key` need the VisionJK ui commands `v_uiDump`, `v_uiMouse` (with the `px` option) and `v_uiKey`. `console`, `screenshot`, `log` and `launch` work with any OpenJK client that reads console commands from a piped stdin.
+`console`, `screenshot`, `log` and `launch` work with any OpenJK client that reads console commands from a piped stdin.
+
+`menu_dump`, `mouse`, `click` and `key` need the VisionJK ui commands `v_uiDump`, `v_uiMouse` (with the `px` option) and `v_uiKey`.
+
+`state`, `project`, `hold`, `view`, `sequence`, `screenshot` with `around`, and `wait` with `kind=ingame` or `kind=time` need the VisionJK cgame commands `v_levelDump` and `v_project`. `view` also needs the extended `setviewpos` of the game module (`x y z yaw [pitch [still]]`). Both are in VisionJK master after 2026-11-02.
 
 ## Setup
 
@@ -21,31 +27,46 @@ Copy the example config and edit it.
 cp jka-mcp.example.json jka-mcp.json
 ```
 
-The server reads the file named by the environment variable `JKA_MCP_CONFIG`. Without it, it reads `jka-mcp.json` next to `jka_mcp.py`. Keys you leave out keep their default.
+The server reads the file named by the environment variable `JKA_MCP_CONFIG`. Without it, it reads `jka-mcp.json` next to `jka_mcp.py`. Keys you leave out keep their default. Objects such as `env`, `presets` and `reload` are merged key by key with the default.
 
 | Key | Meaning | Default |
 |-----|---------|---------|
-| `game_dir` | Folder with the game executable and `base/`. Required. | empty |
-| `binary` | The executable, relative to `game_dir`. | `./visionjk.x86_64` |
-| `home` | `fs_homepath` for the runs (configs, screenshots). | `<game_dir>/../jka-mcp-home` |
+| `game_dir` | Folder with the game executable and `base/`. Required. `prepare` can build it. | empty |
+| `binary` | The client executable, relative to `game_dir`. | `./visionjk.x86_64` |
+| `server_binary` | The dedicated server executable, relative to `game_dir`. | `./visionjkded.x86_64` |
+| `home` | `fs_homepath` of the client `main` (configs, screenshots). Other clients use `<home>-<name>`, the server uses `<home>-server`. | `<game_dir>/../jka-mcp-home` |
 | `fs_game` | Mod folder the client ends up in, where `screenshots/` is. | `japlus` |
-| `launcher` | `gamescope` (headless, no window) or `direct` (a window on the desktop). | `gamescope` |
+| `launcher` | `gamescope` (headless, no window) or `direct` (a window on the desktop). The server always starts directly. | `gamescope` |
 | `env` | Extra environment variables for the game. | `{}` |
-| `args` | Command line words added to every start. | `com_bootlogo 0`, `v_updateCheck 0`, `cl_motd 0`, `s_volume 0`, `s_musicvolume 0`, `com_skipIntro 1` (all as `+set`) |
+| `args` | Command line words added to every client start. | `+set com_bootlogo 0`, `v_updateCheck 0`, `cl_motd 0`, `com_skipIntro 1` |
+| `quiet` | Cvars of a launch without `audio=true`. | `s_volume 0`, `s_musicvolume 0` |
+| `cvars` | Cvars of every client launch. | `con_notifytime 0` |
+| `presets` | Named cvar sets that `launch` can ask for with `preset`. | `msaa8`, `no_spawn_protection` |
 | `renderer` | Value for `cl_renderer`. Empty leaves the choice to the game. | `rd-vulkan-vision` |
+| `server_args` | Command line words added to every server start. | `+set sv_pure 0`, `g_gametype 0` |
+| `server_port` | `net_port` of the server, and the port `connect=localhost` goes to. | `29070` |
+| `prepare` | What the `prepare` tool builds, see below. | both empty |
 | `reload` | What the `reload` tool runs, see below. | all empty |
-| `log_file` | File that also receives the game output. | `<home>/jka-mcp.log` |
+| `log_file` | File that also receives the output of client `main`. Other clients and the server write `jka-mcp.log` in their own home. | `<home>/jka-mcp.log` |
 
-The `reload` object has these keys.
+The `prepare` object builds a game folder of its own, so nobody has to test in the folder the game is played from.
+
+| Key | Meaning |
+|-----|---------|
+| `link` | List of `[source dir, destination dir under game_dir, glob]`. Each match becomes a symlink. The glob is optional (default `*`). |
+| `copy` | List of `[file, destination relative to game_dir]`. Real copies of the executables, the renderers, the modules and the asset pk3. |
+
+The `reload` object has these keys. Each kind has a list of build commands (argv lists) and a list of files to put in place.
 
 | Key | Meaning |
 |-----|---------|
 | `cwd` | Working folder for the build commands. |
-| `menus` | List of commands (each an argv list) that build the menus. |
-| `menus_copy` | List of `[source dir, destination]`. Every file in a source dir is copied to its destination under `<home>/<fs_game>/`. |
+| `menus` | Commands that build the menus. |
+| `menus_copy` | List of `[source dir, destination]`. Every file in a source dir is copied to its destination under `<home>/<fs_game>/` of each running client. |
 | `menus_put` | List of `[built file, destination relative to game_dir]`, e.g. the asset pk3. The game reads it at the next launch. |
-| `modules` | List of commands (each an argv list) that build the modules. |
-| `modules_copy` | List of `[built file, destination relative to game_dir]`. |
+| `modules`, `modules_copy` | Build commands and `[built file, destination relative to game_dir]` for the ui, cgame and game libraries. |
+| `renderer`, `renderer_copy` | The same for the renderer libraries. |
+| `engine`, `engine_copy` | The same for the client and server executables. |
 
 Register the server with Claude Code. The `--transport` option must come before the name.
 
@@ -55,29 +76,76 @@ claude mcp add --transport stdio --scope user jka --env JKA_MCP_CONFIG=/path/to/
 
 ## Tools
 
+Most tools take `client` (default `main`) to pick one of several running clients. Pixel coordinates always refer to the full window size, also when a screenshot was scaled down.
+
 | Tool | What it does | Main arguments |
 |------|--------------|----------------|
-| `launch` | Starts the game and waits for the first menu. | `width`, `height` (default 1920x1080), `extra` (more command line words) |
-| `quit` | Ends the game and its process group. | none |
-| `console` | Runs console commands and returns what the game printed. | `command`, `until` (regex of a line to wait for), `timeout`, `wait` |
-| `screenshot` | Picture of the game window. | `max_width` (default 1280, 0 is full size), `quality` |
-| `menu_dump` | Open menus and their items: name, type, rect, flags, cvar and value, text. | `filter`, `format` (`concise` or `json`), `decorations` |
+| `launch` | Starts a client. Without `map` or `connect` it waits for the first menu. | `client`, `width`, `height` (default 1920x1080), `map`, `connect`, `renderer`, `preset`, `cvars`, `audio`, `vk_debug`, `extra` |
+| `quit` | Ends a client and its process group. | `client`, `all` (every client and the server) |
+| `server_launch` | Starts the dedicated server on a map. | `map`, `gametype` (default 0), `port`, `cvars`, `extra` |
+| `server_quit` | Ends the dedicated server. | none |
+| `console` | Runs console commands and returns what the game printed. | `command`, `until` (regex of a line to wait for), `timeout`, `wait`, `server` |
+| `wait` | Waits for a state, see below. | `kind`, `pattern`, `name`, `value`, `ms`, `join`, `timeout`, `server` |
+| `log` | Lines the game printed. Returns a cursor for `since`. | `lines`, `since`, `pattern`, `server` |
+| `screenshot` | Picture of the game window. Returns an id for `compare`. | `max_width` (default 1280, 0 is full size), `quality`, `crop`, `around`, `size`, `zoom` |
+| `sequence` | Several screenshots at game times, side by side in one picture. | `at_ms`, `hold`, `max_width`, `crop`, `around`, `size`, `zoom` |
+| `compare` | Two kept screenshots side by side. | `a`, `b` (ids), `crop`, `zoom`, `max_width` |
+| `state` | Game time, own player, view and entities near the view (`v_levelDump`). | `radius` (default 1024), `format` (`concise` or `json`) |
+| `project` | Window pixels of world points (`v_project`), null when behind the view. | `points` |
+| `hold` | Presses buttons for a time of game clock, then lets them go. | `buttons`, `ms` (default 500), `screenshot` |
+| `view` | Puts the player at a place and view without the push of a teleport. Third person camera. | `origin`, `yaw`, `pitch`, `third`, `range`, `angle`, `screenshot` |
+| `audio` | Records the sound and returns loudness and main frequencies per window. | `seconds` (default 2), `window_ms` (default 100), `hold` |
+| `menu_dump` | Open menus and their items: name, type, rect, flags, cvar and value, text. | `filter`, `format`, `decorations` |
 | `mouse` | Moves the menu pointer to window pixels and can click, hold, release or use the wheel. | `x`, `y`, `action`, `screenshot` |
 | `click` | Clicks the middle of a menu item found by name or text. | `item`, `menu`, `screenshot` |
 | `key` | Presses a key, or types text into the focused field. | `key`, `text`, `screenshot` |
-| `reload` | Rebuilds menus or modules and loads them into the running game. | `what` (`menus` or `modules`) |
-| `log` | Lines the game printed. Returns a cursor for `since`. | `lines`, `since` |
+| `reload` | Rebuilds and loads into the running clients. | `what` (`menus`, `modules`, `renderer` or `engine`) |
+| `relaunch` | Restarts a client with the same options, back on its map, place and view. | `client`, `keep` (cvar names to carry over) |
+| `prepare` | Builds `game_dir` from `prepare.link` and `prepare.copy`. | none |
 
-`reload` with `menus` runs the menu build, copies the menu files and runs `ui_load`. With `modules` it runs the module build, puts the libraries in place and runs `vid_restart`. If the game is not running, only the build and copy steps happen.
+`launch` with `map` starts with `+devmap`, so cheats are on. `connect` takes an address. `localhost` and `local` are mapped to `127.0.0.1:<server_port>` (or the port given after a colon), because the engine reads `localhost` as the server inside its own process. With `map` or `connect` the call returns after the start, use `wait kind=ingame` for the level. `preset` takes names from the config. The cvars of the config, the presets and `cvars` are written to `jkamcp_launch.cfg` in the home folder and the command line execs it, because the engine drops command line words past 32. With `audio=true` the sound goes to a file through the SDL disk driver, and the quiet volumes are not used. With `vk_debug=true` the Vulkan validation layers run, and their messages are lines with `VULKAN` (`log pattern=VULKAN`).
 
-Pixel coordinates always refer to the full window size, also when a screenshot was scaled down.
+`wait` has four kinds. `ingame` waits until the level is loaded and the player plays. With `join` (default true) it sends `team free` again every 3 seconds and closes open menus. `log` waits for a printed line that matches `pattern`. `cvar` waits until the cvar `name` has `value`. `time` waits until the game clock went on by `ms`. The clock is the one of the cgame, not a frame count.
+
+`hold`, `sequence` and `audio` take buttons as `+forward` or `forward`, and release them at the end, also after an error. `sequence` projects `around` once at the start.
+
+`view` sends `setviewpos x y z yaw pitch still` and waits up to 3 seconds until the snapshots of the server show the player there. It needs cheats. `third` sets `cg_thirdPerson`, `range` sets `cg_thirdPersonRange`, `angle` sets `cg_thirdPersonAngle`.
+
+`reload` with `menus` runs the menu build, copies the menu files, puts the pk3 and runs `ui_load`. With `modules` it runs the module build, puts the libraries in place and runs `vid_restart`. `renderer` does the same with the renderer libraries. With `engine` the clients are relaunched like `relaunch` does. If no client runs, only the build and copy steps happen.
+
+`relaunch` keeps the map, the place and the view, and the cvars named in `keep`, which are set again after the level loads.
+
+`prepare` refuses to run while a client or the server runs, refuses `/tmp`, and refuses a `game_dir` inside a link source folder. It never writes into the source folders.
+
+## Example
+
+A typical gameplay check, as tool calls.
+
+```
+prepare {}
+launch {"map": "mp/ffa1", "preset": ["no_spawn_protection"]}
+wait {"kind": "ingame"}
+view {"origin": [0, 0, 100], "yaw": 90, "third": true, "range": 120}
+hold {"buttons": ["+forward"], "ms": 800}
+sequence {"at_ms": [0, 100, 250, 500], "hold": ["+attack"]}
+state {"radius": 512}
+quit {"all": true}
+```
+
+For a check against the local server, call `server_launch {"map": "mp/ffa1"}` first and use `"connect": "localhost"` in `launch` instead of `map`.
 
 ## Notes
 
 - The game folder and the home folder must not be under `/tmp`. The client refuses game code from temporary paths.
+- `localhost` in `connect` is mapped to `127.0.0.1` and the server port, see above.
+- The engine takes at most 32 commands from the command line, so launch cvars go into a cfg.
 - `com_bootlogo 0` is in the default args because the opening logos never end without a window.
-- Modules and menu files are put in place by copying to a `.new` file and renaming it, so a running game is not broken.
-- Only one game runs at a time. `launch` fails while a game is running.
+- Waits for frames are not reliable, the frame rate changes. `hold`, `sequence` and `wait kind=time` use the game clock.
+- The volumes are archived in the config of the home folder. A quiet launch leaves them at 0, so a launch with `audio=true` sets them again.
+- `con_notifytime 0` is set by default so console lines do not cover the view.
+- Modules, renderers, menu files and copies of `prepare` are put in place by copying to a `.new` file and renaming it, so a running game is not broken.
+- gamescope may hang on exit with some drivers. `quit` sends `quit` to the game, then kills the whole process group.
+- A client name must be unique. `launch` fails while a client of that name runs.
 
 ## License
 

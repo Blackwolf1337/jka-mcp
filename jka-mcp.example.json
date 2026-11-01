@@ -1,5 +1,7 @@
 {
-  "game_dir": "/path/to/JediAcademy",
+  "game_dir": "/path/to/jka-mcp-game",
+  "server_binary": "./visionjkded.x86_64",
+  "server_port": 29070,
   "home": "/path/to/jka-mcp-home",
   "fs_game": "japlus",
   "launcher": "gamescope",
@@ -7,56 +9,59 @@
   "env": {
     "VK_DRIVER_FILES": "/usr/share/vulkan/icd.d/radeon_icd.json"
   },
+  "presets": {
+    "msaa8": {"r_ext_multisample": "8"},
+    "no_spawn_protection": {"g_spawnInvulnerability": "0"}
+  },
+  "prepare": {
+    "link": [
+      ["/path/to/GameData/base", "base", "assets*.pk3"]
+    ],
+    "copy": [
+      ["/path/to/visionjk/build64/visionjk.x86_64", "visionjk.x86_64"],
+      ["/path/to/visionjk/build64/visionjkded.x86_64", "visionjkded.x86_64"],
+      ["/path/to/visionjk/build64/codemp/rd-vulkan-vision/rd-vulkan-vision_x86_64.so", "rd-vulkan-vision_x86_64.so"],
+      ["/path/to/visionjk/build64/codemp/rd-vanilla/rd-vanilla_x86_64.so", "rd-vanilla_x86_64.so"],
+      ["/path/to/visionjk/build64/codemp/ui/uix86_64.so", "japlus/uix86_64.so"],
+      ["/path/to/visionjk/build64/codemp/cgame/cgamex86_64.so", "japlus/cgamex86_64.so"],
+      ["/path/to/visionjk/build64/codemp/game/jampgamex86_64.so", "japlus/jampgamex86_64.so"],
+      ["/path/to/visionjk/build64/assets/zz_japlus_client_assets.pk3", "japlus/zz_japlus_client_assets.pk3"]
+    ]
+  },
   "reload": {
     "cwd": "/path/to/visionjk",
     "menus": [
-      [
-        "python3",
-        "tools/menus/build.py"
-      ],
-      [
-        "cmake",
-        "--build",
-        "build64",
-        "--target",
-        "zz_japlus_client_assets"
-      ]
+      ["python3", "tools/menus/build.py"],
+      ["cmake", "--build", "build64", "--target", "zz_japlus_client_assets"]
     ],
     "menus_copy": [
-      [
-        "/path/to/visionjk/assets/japlus_client/ui",
-        "ui"
-      ],
-      [
-        "/path/to/visionjk/assets/japlus_client/strings",
-        "strings"
-      ]
-    ],
-    "modules": [
-      [
-        "cmake",
-        "--build",
-        "build64",
-        "--target",
-        "uix86_64",
-        "cgamex86_64"
-      ]
-    ],
-    "modules_copy": [
-      [
-        "/path/to/visionjk/build64/codemp/ui/uix86_64.so",
-        "japlus/uix86_64.so"
-      ],
-      [
-        "/path/to/visionjk/build64/codemp/cgame/cgamex86_64.so",
-        "japlus/cgamex86_64.so"
-      ]
+      ["/path/to/visionjk/assets/japlus_client/ui", "ui"],
+      ["/path/to/visionjk/assets/japlus_client/strings", "strings"]
     ],
     "menus_put": [
-      [
-        "/path/to/visionjk/build64/assets/zz_japlus_client_assets.pk3",
-        "japlus/zz_japlus_client_assets.pk3"
-      ]
+      ["/path/to/visionjk/build64/assets/zz_japlus_client_assets.pk3", "japlus/zz_japlus_client_assets.pk3"]
+    ],
+    "modules": [
+      ["cmake", "--build", "build64", "--target", "uix86_64", "cgamex86_64", "jampgamex86_64"]
+    ],
+    "modules_copy": [
+      ["/path/to/visionjk/build64/codemp/ui/uix86_64.so", "japlus/uix86_64.so"],
+      ["/path/to/visionjk/build64/codemp/cgame/cgamex86_64.so", "japlus/cgamex86_64.so"],
+      ["/path/to/visionjk/build64/codemp/game/jampgamex86_64.so", "japlus/jampgamex86_64.so"]
+    ],
+    "renderer": [
+      ["cmake", "--build", "build64", "--target", "rd-vulkan-vision_x86_64", "rd-vanilla_x86_64"]
+    ],
+    "renderer_copy": [
+      ["/path/to/visionjk/build64/codemp/rd-vulkan-vision/rd-vulkan-vision_x86_64.so", "rd-vulkan-vision_x86_64.so"],
+      ["/path/to/visionjk/build64/codemp/rd-vanilla/rd-vanilla_x86_64.so", "rd-vanilla_x86_64.so"]
+    ],
+    "engine": [
+      ["cmake", "--build", "build64", "--target", "visionjk.x86_64", "visionjkded.x86_64"]
+    ],
+    "engine_copy": [
+      ["/path/to/visionjk/build64/visionjk.x86_64", "visionjk.x86_64"],
+      ["/path/to/visionjk/build64/visionjkded.x86_64", "visionjkded.x86_64"]
     ]
   }
 }

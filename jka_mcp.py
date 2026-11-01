@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""jka-mcp: an MCP server that runs Jedi Knight: Jedi Academy (an OpenJK based client such as VisionJK) without a
-window and lets an AI assistant use it: console commands, screenshots, the mouse and keys in the menus, a dump of
-the menus with the rectangles of their items, and reloading menus or modules into the running game.
+"""jka-mcp: an MCP server that runs Jedi Knight: Jedi Academy (OpenJK based clients such as VisionJK) without a
+window and lets an AI assistant test it: menus (a dump of their items, mouse, keys), gameplay (held buttons timed
+by the game clock, the view, a dump of the level, world points projected to the screen), screenshots (cropped,
+zoomed, in sequences, side by side), sound (recorded and measured), several clients and a local dedicated server,
+and rebuilding menus, modules, the renderer or the engine into the running game.
 
-One game at a time, started in gamescope's headless backend (no window, no sound). The server speaks the Model
-Context Protocol over stdio (JSON-RPC 2.0, one message a line) and needs only the Python standard library. With
-Pillow installed, screenshots can be made smaller before they are sent.
+Clients run in gamescope's headless backend (no window). The server speaks the Model Context Protocol over stdio
+(JSON-RPC 2.0, one message a line) and needs only the Python standard library; Pillow makes screenshots smaller and
+does crops, sequences and comparisons, numpy does the analysis of sound.
 
 Configuration: a JSON file named by JKA_MCP_CONFIG (default: jka-mcp.json next to this file), keys see CONFIG below.
 """
 import base64
 import collections
 import glob
+import io
 import json
 import os
 import re
@@ -22,34 +25,55 @@ import sys
 import threading
 import time
 
-VERSION = '0.1.0'
+VERSION = '0.2.0'
 PROTOCOLS = ('2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05')
 
 INSTRUCTIONS = (
-    'Drives one Jedi Academy client (VisionJK) without a window. Start it with launch, end it with quit. '
-    'Coordinates are pixels of the game window, the same as in a full size screenshot (menu_dump gives each item '
-    'its rect x,y,w,h). Prefer click by item name over mouse; pass screenshot=true to an action to see the result '
-    'in the same call. reload rebuilds menus or modules and loads them into the running game.')
+    'Drives Jedi Academy (VisionJK) clients without a window, and a local dedicated server. launch starts a client '
+    '(name it with "client" to run several; the default is "main"), quit ends it. Coordinates are pixels of the game '
+    'window. Menus: menu_dump, click (by item name), key, mouse. Gameplay: launch with map= (devmap, cheats on) or '
+    'connect=, then wait kind=ingame, hold for buttons timed by the game clock, view to place the player, state for '
+    'the player and the entities, project for world points on the screen. screenshot can crop, zoom or frame a world '
+    'point; sequence takes several at game times; compare puts two side by side. Pass screenshot=true to an action to '
+    'see the result in the same call. reload rebuilds menus, modules, the renderer or the engine.')
 
 # what the configuration file may say, and what it is without it
 CONFIG = {
     'game_dir': '',                 # folder with the executable of the game (and base/ with the assets)
     'binary': './visionjk.x86_64',  # the executable, relative to game_dir
-    'home': '',                     # fs_homepath for the runs (configs, screenshots); empty: <game_dir>/../jka-mcp-home
+    'server_binary': './visionjkded.x86_64',
+    'home': '',                     # fs_homepath of the client "main" (configs, screenshots); others get <home>-<name>;
+                                    #   empty: <game_dir>/../jka-mcp-home
     'fs_game': 'japlus',            # the mod folder the client ends up in (where screenshots/ is)
     'launcher': 'gamescope',        # 'gamescope' (headless, no window) or 'direct' (a window on the desktop)
     'env': {},                      # more environment, e.g. {"VK_DRIVER_FILES": "/usr/share/vulkan/icd.d/radeon_icd.json"}
     # (com_bootlogo 0: with only +set words the engine plays the opening logos, which never end without a window)
-    'args': ['+set', 'com_bootlogo', '0', '+set', 'v_updateCheck', '0', '+set', 'cl_motd', '0', '+set', 's_volume', '0', '+set', 's_musicvolume', '0',
-             '+set', 'com_skipIntro', '1'],
+    'args': ['+set', 'com_bootlogo', '0', '+set', 'v_updateCheck', '0', '+set', 'cl_motd', '0', '+set', 'com_skipIntro', '1'],
+    'quiet': {'s_volume': '0', 's_musicvolume': '0'},  # cvars of a launch without audio=true
+    # cvars of every client launch: no console lines over the view (the dumps of the tools print there)
+    'cvars': {'con_notifytime': '0'},
+    'server_args': ['+set', 'sv_pure', '0', '+set', 'g_gametype', '0'],
+    'server_port': 29070,
     'renderer': 'rd-vulkan-vision', # cl_renderer, empty: the game's own choice
-    'reload': {                     # what reload runs; each a list of commands (argv lists), run in 'cwd'
+    'presets': {                    # named sets of cvars a launch can ask for (preset=[...])
+        'msaa8': {'r_ext_multisample': '8'},
+        'no_spawn_protection': {'g_spawnInvulnerability': '0'},
+    },
+    'prepare': {                    # what prepare builds: a game folder of its own (never the folder someone plays from)
+        'link': [],                 # [[source dir, destination dir under game_dir, glob], ...]: symlinks, e.g. the base pk3s
+        'copy': [],                 # [[file, destination relative to game_dir], ...]: real copies (binary, renderers, modules)
+    },
+    'reload': {                     # what reload runs: for each kind a list of commands (argv lists), run in 'cwd'
         'cwd': '',
         'menus': [],                # e.g. [["python3", "tools/menus/build.py"]]
         'menus_copy': [],           # [[source dir, destination under home/<fs_game>], ...]: loose files the game reads first
         'menus_put': [],            # [[built file, destination relative to game_dir], ...], e.g. the asset pk3
         'modules': [],              # e.g. [["ninja", "-C", "build64", "uix86_64.so", "cgamex86_64.so"]]
         'modules_copy': [],         # [[built file, destination relative to game_dir], ...]
+        'renderer': [],             # the renderer libraries: vid_restart after them
+        'renderer_copy': [],
+        'engine': [],               # the executable: the clients are relaunched (relaunch keeps map, place and view)
+        'engine_copy': [],
     },
     'log_file': '',                 # where the output of the game goes as well; empty: <home>/jka-mcp.log
 }
@@ -78,44 +102,108 @@ def load_config():
     return cfg
 
 
-class Game:
-    """The running game: its process, its output (a queue of lines a reader thread fills) and its stdin, which the
-    console of the client reads line by line when it is not a terminal."""
+def not_temporary(path, what):
+    # (an OpenJK client refuses game code from a temporary folder: game and home must not be under /tmp)
+    real = os.path.realpath(path)
+    if real == '/tmp' or real.startswith('/tmp/') or real.startswith('/var/tmp/'):
+        raise RuntimeError('%s must not be under /tmp (the client refuses game code from a temporary folder): %s' % (what, path))
 
-    def __init__(self, cfg):
+
+class Game:
+    """A running client or dedicated server: its process, its output (a queue of lines a reader thread fills) and its
+    stdin, which the console of the engine reads line by line when it is not a terminal."""
+
+    def __init__(self, cfg, name='main', server=False):
         self.cfg = cfg
+        self.name = name
+        self.server = server
         self.proc = None
-        self.lines = collections.deque(maxlen=20000)
+        self.lines = collections.deque(maxlen=40000)
         self.count = 0              # lines seen so far, for 'since'
         self.cond = threading.Condition()
         self.shot = 0
         self.size = (0, 0)
         self.log = None
+        self.opts = {}
+        self.audio_path = None
+        self.audio_pos = 0
+        base = os.path.abspath(cfg['home'])
+        self.home = base if name == 'main' and not server else '%s-%s' % (base, 'server' if server else name)
 
     # ---- the process
 
     def running(self):
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self, width=1920, height=1080, extra=None):
+    def _launch_cfg(self, cvars):
+        """The cvars of a launch go into a cfg that the command line execs: the engine takes at most 32 + commands from
+        the command line and drops the rest without a word."""
+        text = ''.join('set %s "%s"\n' % (k, str(v).replace('"', '')) for k, v in cvars.items())
+        for folder in ('base', self.cfg['fs_game']):
+            os.makedirs(os.path.join(self.home, folder), exist_ok=True)
+            with open(os.path.join(self.home, folder, 'jkamcp_launch.cfg'), 'w', encoding='utf-8') as f:
+                f.write(text)
+        return ['+exec', 'jkamcp_launch.cfg']
+
+    def start(self, opts):
         if self.running():
-            raise RuntimeError('the game is already running; quit it first')
+            raise RuntimeError('%s is already running; quit it first' % self.label())
         cfg = self.cfg
         game_dir = os.path.abspath(cfg['game_dir'])
         if not os.path.isdir(game_dir):
-            raise RuntimeError('game_dir is not set or not a folder: %r' % cfg['game_dir'])
-        home = os.path.abspath(cfg['home'])
-        # (an OpenJK client may refuse game code from a temporary folder: keep home and game out of /tmp)
-        os.makedirs(os.path.join(home, cfg['fs_game']), exist_ok=True)
-        args = [cfg['binary'], '+set', 'fs_homepath', home, '+set', 'r_mode', '-1', '+set', 'r_customwidth', str(width),
-                '+set', 'r_customheight', str(height), '+set', 'r_fullscreen', '0']
-        if cfg.get('renderer'):
-            args += ['+set', 'cl_renderer', cfg['renderer']]
-        args += list(cfg.get('args') or []) + list(extra or [])
+            raise RuntimeError('game_dir is not set or not a folder: %r (prepare makes one)' % cfg['game_dir'])
+        not_temporary(game_dir, 'game_dir')
+        not_temporary(self.home, 'home')
+        os.makedirs(os.path.join(self.home, cfg['fs_game']), exist_ok=True)
+        self.opts = dict(opts)
+        width, height = int(opts.get('width', 1920)), int(opts.get('height', 1080))
+        cvars = {} if self.server else dict(cfg.get('cvars') or {})
+        for p in opts.get('preset') or []:
+            if p not in (cfg.get('presets') or {}):
+                raise RuntimeError('no preset %r; there are: %s' % (p, ', '.join(sorted(cfg.get('presets') or {}))))
+            cvars.update(cfg['presets'][p])
         env = dict(os.environ)
         env.update({k: str(v) for k, v in (cfg.get('env') or {}).items()})
-        env['SDL_AUDIODRIVER'] = env.get('SDL_AUDIODRIVER', 'dummy')
-        if cfg['launcher'] == 'gamescope':
+        if self.server:
+            args = [cfg['server_binary'], '+set', 'fs_homepath', self.home, '+set', 'dedicated', '1',
+                    '+set', 'net_port', str(opts.get('port') or cfg.get('server_port', 29070))] + list(cfg.get('server_args') or [])
+        else:
+            args = [cfg['binary'], '+set', 'fs_homepath', self.home, '+set', 'r_mode', '-1', '+set', 'r_customwidth', str(width),
+                    '+set', 'r_customheight', str(height), '+set', 'r_fullscreen', '0']
+            if cfg.get('renderer'):
+                args += ['+set', 'cl_renderer', opts.get('renderer') or cfg['renderer']]
+            if opts.get('vk_debug'):
+                # (the Vulkan validation layers, VisionJK: v_vkDebug; the messages are lines with VULKAN in the log)
+                args += ['+set', 'v_vkDebug', '1']
+            args += list(cfg.get('args') or [])
+            if opts.get('audio'):
+                # the sound into a file: SDL's disk driver writes what the game plays, S16LE stereo at the rate of the
+                # device, in real time
+                self.audio_path = os.path.join(self.home, 'jkamcp_audio.raw')
+                if os.path.exists(self.audio_path):
+                    os.remove(self.audio_path)
+                self.audio_pos = 0
+                env['SDL_AUDIODRIVER'] = 'disk'
+                env['SDL_DISKAUDIOFILE'] = self.audio_path
+                # (the volumes are archived: a quiet launch before leaves them at 0 in the config)
+                cvars = dict({'s_volume': '1', 's_musicvolume': '0'}, **cvars)
+            else:
+                self.audio_path = None
+                env['SDL_AUDIODRIVER'] = env.get('SDL_AUDIODRIVER', 'dummy')
+                cvars = dict(cfg.get('quiet') or {}, **cvars)
+        cvars.update({k: str(v) for k, v in (opts.get('cvars') or {}).items()})
+        if cvars:
+            args += self._launch_cfg(cvars)
+        args += list(opts.get('extra') or [])
+        if opts.get('map'):
+            args += ['+devmap', opts['map']]
+        elif opts.get('connect') and not self.server:
+            # ("localhost" is the server inside the client's own process for the engine, not the one on the UDP port)
+            where = opts['connect']
+            if where.split(':')[0] in ('localhost', 'local'):
+                where = '127.0.0.1:%s' % (where.split(':')[1] if ':' in where else cfg.get('server_port', 29070))
+            args += ['+connect', where]
+        if not self.server and cfg['launcher'] == 'gamescope':
             for k in ('DISPLAY', 'WAYLAND_DISPLAY'):
                 env.pop(k, None)
             env['SDL_VIDEODRIVER'] = 'x11'
@@ -123,18 +211,30 @@ class Game:
                    '-h', str(height), '--'] + args
         else:
             cmd = args
-        self.log = open(cfg['log_file'], 'a', encoding='utf-8', errors='replace') if cfg.get('log_file') else None
-        self.lines.clear()
+        log_file = cfg.get('log_file')
+        if log_file and (self.server or self.name != 'main'):
+            log_file = os.path.join(self.home, 'jka-mcp.log')
+        if log_file:
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        self.log = open(log_file, 'a', encoding='utf-8', errors='replace') if log_file else None
+        with self.cond:
+            self.lines.clear()
+            self.count = 0
         self.proc = subprocess.Popen(cmd, cwd=game_dir, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, start_new_session=True)
         self.size = (width, height)
         threading.Thread(target=self._read, daemon=True).start()
-        # ready when the engine has run its startup and the first frame of the menus is near
-        if not self.wait_for(r'Common Initialization Complete|execing visionjk\.cfg|execing autoexec', 60):
+        if not self.wait_for(r'Common Initialization Complete|execing visionjk\.cfg|execing autoexec|Hunk_Clear', 60, 0):
             out = self.tail(40)[0]
             self.stop()
-            raise RuntimeError('the game did not start:\n' + out)
-        # then for the first menu (a +map or +connect on the command line may keep the menus closed)
+            raise RuntimeError('%s did not start:\n%s' % (self.label(), out))
+        if self.server:
+            self.wait_for(r'Server: |------ Server Initialization|ClientBegin|Hitch warning', 30, 0)
+            return '%s started (pid %d), port %s' % (self.label(), self.proc.pid, opts.get('port') or cfg.get('server_port', 29070))
+        if opts.get('map') or opts.get('connect'):
+            return '%s started %dx%d (pid %d), loading %s; wait kind=ingame for the level' % (
+                self.label(), width, height, self.proc.pid, opts.get('map') or opts.get('connect'))
+        # the first menu (the logos are off, see 'args')
         menus = []
         end = time.time() + 20
         while time.time() < end and self.running():
@@ -145,7 +245,10 @@ class Game:
             if menus:
                 break
             time.sleep(0.5)
-        return 'started %dx%d (pid %d), open menus: %s' % (width, height, self.proc.pid, ', '.join(menus) or 'none')
+        return '%s started %dx%d (pid %d), open menus: %s' % (self.label(), width, height, self.proc.pid, ', '.join(menus) or 'none')
+
+    def label(self):
+        return 'the server' if self.server else 'client %s' % self.name
 
     def stop(self):
         if not self.proc:
@@ -156,8 +259,8 @@ class Game:
                 self.proc.wait(timeout=8)
             except Exception:
                 pass
-        if self.proc.poll() is None or self.cfg['launcher'] == 'gamescope':
-            # gamescope may stay with its helpers: end the whole session of the run
+        if self.proc.poll() is None or (self.cfg['launcher'] == 'gamescope' and not self.server):
+            # gamescope may stay with its helpers (and hangs on exit with some drivers): end the whole session of the run
             try:
                 os.killpg(self.proc.pid, signal.SIGTERM)
             except Exception:
@@ -174,7 +277,7 @@ class Game:
         if self.log:
             self.log.close()
             self.log = None
-        return 'stopped (exit code %s)' % code
+        return '%s stopped (exit code %s)' % (self.label(), code)
 
     def _read(self):
         proc = self.proc
@@ -198,7 +301,7 @@ class Game:
 
     def send(self, command):
         if not self.running():
-            raise RuntimeError('the game is not running; use launch first')
+            raise RuntimeError('%s is not running; use launch first' % self.label())
         for line in command.splitlines():
             self.proc.stdin.write((line + '\n').encode('utf-8'))
         self.proc.stdin.flush()
@@ -241,29 +344,39 @@ class Game:
             time.sleep(wait)
         return self.since(m)
 
-    def tail(self, n=50, since=None):
+    def tail(self, n=50, since=None, pattern=None):
         with self.cond:
             lines = list(self.lines)
             if since is not None:
                 lines = lines[-(self.count - since):] if self.count > since else []
+            if pattern:
+                rx = re.compile(pattern)
+                lines = [line for line in lines if rx.search(line)]
             return '\n'.join(lines[-n:]), self.count
+
+    def cvar(self, name, timeout=3.0):
+        lines = self.command(name, until=r'^Cvar %s = |"%s" is|^%s is' % ((re.escape(name),) * 3), timeout=timeout)
+        for line in lines:
+            m = re.match(r'Cvar \S+ = "(.*?)"', line) or re.match(r'"\S+" is:"(.*?)"', line)
+            if m:
+                return m.group(1)
+        return None
 
     # ---- what the tools build on
 
     def screenshot(self, timeout=15.0):
         self.shot += 1
-        name = 'jkamcp_%d_%d' % (os.getpid(), self.shot)
+        name = 'jkamcp_%d_%s_%d' % (os.getpid(), self.name, self.shot)
         m = self.mark()
         self.send('screenshot_png %s' % name)
         line = self.wait_for(r'Wrote screenshots/%s\.png' % name, timeout, m)
         if not line:
             raise RuntimeError('no screenshot was written:\n' + '\n'.join(self.since(m)[-15:]))
-        home = os.path.abspath(self.cfg['home'])
-        found = glob.glob(os.path.join(home, '*', 'screenshots', name + '.png'))
+        found = glob.glob(os.path.join(self.home, '*', 'screenshots', name + '.png'))
         if not found:
             found = glob.glob(os.path.join(os.path.abspath(self.cfg['game_dir']), '*', 'screenshots', name + '.png'))
         if not found:
-            raise RuntimeError('the game wrote %s.png, but it is not under %s' % (name, home))
+            raise RuntimeError('the game wrote %s.png, but it is not under %s' % (name, self.home))
         with open(found[0], 'rb') as f:
             data = f.read()
         os.remove(found[0])
@@ -310,23 +423,195 @@ class Game:
             raise RuntimeError('no answer to v_uiDump (it needs a ui of VisionJK): ' + ' | '.join(lines[-5:]))
         return out
 
+    def level(self, radius=2048):
+        """The level as the cgame sees it (VisionJK: v_levelDump): time, player, view, entities near the view."""
+        lines = self.command('v_levelDump %s' % radius, until=r'^leveldump end', timeout=5)
+        out = {'entities': []}
+        for line in lines:
+            if not line.startswith('leveldump '):
+                continue
+            parts = line.split(' ')
+            if parts[1] == 'end':
+                break
+            rec = {}
+            for kv in parts[2:]:
+                k, _, val = kv.partition('=')
+                if ',' in val:
+                    try:
+                        rec[k] = [float(a) for a in val.split(',')]
+                        continue
+                    except ValueError:
+                        pass
+                try:
+                    rec[k] = int(val)
+                except ValueError:
+                    try:
+                        rec[k] = float(val)
+                    except ValueError:
+                        rec[k] = val
+            if parts[1] == 'entity':
+                out['entities'].append(rec)
+            else:
+                out[parts[1]] = rec
+        if 'time' not in out:
+            raise RuntimeError('no answer to v_levelDump (it needs a cgame of VisionJK and a level): ' + ' | '.join(lines[-5:]))
+        return out
+
+    def game_time(self):
+        return self.level(0)['time']['cg']
+
+    def wait_game_ms(self, ms, timeout=None):
+        """Waits until the clock of the cgame went on by ms (not frames: the frame rate changes)."""
+        start = self.game_time()
+        end = time.time() + (timeout if timeout is not None else max(5.0, ms / 1000.0 * 4 + 5))
+        while time.time() < end:
+            now = self.game_time()
+            if now - start >= ms:
+                return now - start
+            time.sleep(min(0.05, max(0.005, (ms - (now - start)) / 2000.0)))
+        raise RuntimeError('the game clock did not go on by %d ms (paused, or no level?)' % ms)
+
+    def project(self, point):
+        lines = self.command('v_project %g %g %g' % tuple(point), until=r'^project ', timeout=3)
+        for line in lines:
+            if line.startswith('project behind'):
+                return None
+            m = re.match(r'project (\S+) (\S+)', line)
+            if m:
+                return float(m.group(1)), float(m.group(2))
+        raise RuntimeError('no answer to v_project (it needs a cgame of VisionJK and a level)')
+
+
+GAMES = {}          # the clients by name, and the server under '#server'
+
+
+def game_of(cfg, a, create=False, server=False):
+    key = '#server' if server else (a.get('client') or 'main')
+    g = GAMES.get(key)
+    if g is None:
+        if not create:
+            raise RuntimeError('no %s; use %s first' % ('server' if server else 'client %r' % key, 'server_launch' if server else 'launch'))
+        g = GAMES[key] = Game(cfg, key, server)
+    return g
+
+
+# ---- pictures
+
+def _pil():
+    try:
+        from PIL import Image, ImageDraw
+        return Image, ImageDraw
+    except ImportError:
+        return None, None
+
+
+def picture(data, crop=None, zoom=1.0):
+    Image, _ = _pil()
+    if Image is None:
+        if crop or zoom != 1.0:
+            raise RuntimeError('crop and zoom need Pillow (pip install pillow)')
+        return None
+    im = Image.open(io.BytesIO(data)).convert('RGB')
+    if crop:
+        x, y, w, h = [int(round(v)) for v in crop]
+        x, y = max(0, x), max(0, y)
+        im = im.crop((x, y, min(im.width, x + max(1, w)), min(im.height, y + max(1, h))))
+    if zoom and zoom != 1.0:
+        im = im.resize((max(1, round(im.width * zoom)), max(1, round(im.height * zoom))), Image.LANCZOS)
+    return im
+
+
+def image_content(data, max_width=1280, quality=85, crop=None, zoom=1.0, im=None):
+    """A screenshot as MCP image content: cropped, zoomed, smaller and as JPEG where Pillow is there, else the PNG."""
+    if im is None:
+        im = picture(data, crop, zoom)
+    if im is None:
+        return {'type': 'image', 'data': base64.b64encode(data).decode(), 'mimeType': 'image/png'}
+    Image, _ = _pil()
+    if max_width and im.width > max_width:
+        im = im.resize((max_width, round(im.height * max_width / im.width)), Image.LANCZOS)
+    buf = io.BytesIO()
+    im.save(buf, 'JPEG', quality=quality)
+    return {'type': 'image', 'data': base64.b64encode(buf.getvalue()).decode(), 'mimeType': 'image/jpeg'}
+
+
+def strip(images, labels):
+    """Pictures side by side with a label over each."""
+    Image, ImageDraw = _pil()
+    if Image is None:
+        raise RuntimeError('sequences and comparisons need Pillow (pip install pillow)')
+    h = max(i.height for i in images)
+    images = [i if i.height == h else i.resize((round(i.width * h / i.height), h), Image.LANCZOS) for i in images]
+    out = Image.new('RGB', (sum(i.width for i in images) + 8 * (len(images) - 1), h + 22), (255, 0, 255))
+    draw = ImageDraw.Draw(out)
+    x = 0
+    for im, label in zip(images, labels):
+        out.paste(im, (x, 22))
+        draw.rectangle((x, 0, x + im.width, 21), fill=(0, 0, 0))
+        draw.text((x + 4, 4), label, fill=(255, 255, 255))
+        x += im.width + 8
+    return out
+
+
+SHOTS = collections.OrderedDict()   # the last screenshots by id, for compare
+SHOT_COUNT = 0
+
+
+def keep_shot(data, label):
+    global SHOT_COUNT
+    SHOT_COUNT += 1
+    sid = 's%d' % SHOT_COUNT
+    SHOTS[sid] = (data, label)
+    while len(SHOTS) > 30:
+        SHOTS.popitem(last=False)
+    return sid
+
+
+def framing(game, a):
+    """The rectangle a screenshot is cut to: crop=[x,y,w,h], or around=[x,y,z] (a point of the level) with size=[w,h]."""
+    if a.get('around'):
+        p = game.project(a['around'])
+        if p is None:
+            raise RuntimeError('the point %s is behind the view' % (a['around'],))
+        w, h = a.get('size') or [400, 300]
+        return [p[0] - w / 2.0, p[1] - h / 2.0, w, h], p
+    return a.get('crop'), None
+
+
+# ---- sound
+
+def analyse_audio(raw, rate, window_ms=100, peaks=3):
+    """Loudness (dBFS) and the strongest frequencies of S16LE stereo sound, over windows of window_ms."""
+    try:
+        import numpy as np
+    except ImportError:
+        raise RuntimeError('the analysis of sound needs numpy (pip install numpy)')
+    a = np.frombuffer(raw[:len(raw) // 4 * 4], dtype='<i2').reshape(-1, 2).astype(np.float64) / 32768.0
+    mono = a.mean(axis=1)
+    n = max(1, int(rate * window_ms / 1000))
+    rows = []
+    for i in range(0, len(mono) - n + 1, n):
+        w = mono[i:i + n]
+        rms = float(np.sqrt(np.mean(w * w)))
+        db = 20 * np.log10(rms) if rms > 1e-9 else -120.0
+        spec = np.abs(np.fft.rfft(w * np.hanning(n)))
+        freqs = np.fft.rfftfreq(n, 1.0 / rate)
+        top = []
+        if rms > 1e-6:
+            order = np.argsort(spec[1:])[::-1] + 1
+            for k in order:
+                f = float(freqs[k])
+                if all(abs(f - t) > rate / n * 3 for t in top):
+                    top.append(f)
+                if len(top) >= peaks:
+                    break
+        rows.append((i / rate, db, top))
+    whole = float(np.sqrt(np.mean(mono * mono))) if len(mono) else 0.0
+    peak = float(np.max(np.abs(a))) if len(a) else 0.0
+    return rows, (20 * np.log10(whole) if whole > 1e-9 else -120.0), (20 * np.log10(peak) if peak > 1e-9 else -120.0)
+
 
 # ---- the tools
-
-def image_content(data, max_width, quality):
-    """A screenshot as MCP image content: smaller and as JPEG where Pillow is there, else the PNG as it is."""
-    try:
-        from PIL import Image
-        import io
-        im = Image.open(io.BytesIO(data)).convert('RGB')
-        if max_width and im.width > max_width:
-            im = im.resize((max_width, round(im.height * max_width / im.width)), Image.LANCZOS)
-        buf = io.BytesIO()
-        im.save(buf, 'JPEG', quality=quality)
-        return {'type': 'image', 'data': base64.b64encode(buf.getvalue()).decode(), 'mimeType': 'image/jpeg'}
-    except ImportError:
-        return {'type': 'image', 'data': base64.b64encode(data).decode(), 'mimeType': 'image/png'}
-
 
 def text(s):
     return {'type': 'text', 'text': s}
@@ -358,61 +643,146 @@ def schema(props=None, required=None):
     return out
 
 
+CLIENT = {'client': {'type': 'string', 'default': 'main', 'description': 'which client (launch names them)'}}
 SHOT = {'screenshot': {'type': 'boolean', 'default': False, 'description': 'also return a screenshot taken after the action'}}
+FRAME = {'crop': {'type': 'array', 'items': {'type': 'number'}, 'description': '[x, y, w, h] in window pixels'},
+         'around': {'type': 'array', 'items': {'type': 'number'}, 'description': '[x, y, z]: a point of the level to frame'},
+         'size': {'type': 'array', 'items': {'type': 'number'}, 'description': '[w, h] of the frame around the point', 'default': [400, 300]},
+         'zoom': {'type': 'number', 'default': 1}}
 RO = {'readOnlyHint': True, 'openWorldHint': False}
 ACT = {'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False}
+P = dict  # (short for the property dicts below)
 
 TOOLS = [
-    {'name': 'launch', 'title': 'Start the game',
-     'description': 'Start the game without a window (gamescope headless, no sound) and wait for the first menu. Call this first; '
-                    'one game at a time. width/height: window size in pixels. extra: more command line words, e.g. ["+devmap", "mp/ffa1"].',
-     'inputSchema': schema({'width': {'type': 'integer', 'default': 1920}, 'height': {'type': 'integer', 'default': 1080},
-                            'extra': {'type': 'array', 'items': {'type': 'string'}}}),
-     'annotations': {'readOnlyHint': False, 'destructiveHint': False, 'idempotentHint': False, 'openWorldHint': False}},
-    {'name': 'quit', 'title': 'End the game', 'description': 'End the running game (quit, then end its process group).',
-     'inputSchema': schema(), 'annotations': {'readOnlyHint': False, 'destructiveHint': True, 'idempotentHint': True, 'openWorldHint': False}},
+    {'name': 'launch', 'title': 'Start a client',
+     'description': 'Start a client without a window (gamescope headless) and wait for its first menu, or with map= (devmap, '
+                    'cheats on) or connect= (an address, e.g. "localhost" for server_launch) for the level: then use wait '
+                    'kind=ingame. client: a name to run several. preset: named cvar sets of the configuration; cvars: more '
+                    '(written to a cfg, the engine drops command line words past 32). audio: record the sound (tool audio). '
+                    'vk_debug: Vulkan validation (log pattern=VULKAN).',
+     'inputSchema': schema(dict(CLIENT, width=P(type='integer', default=1920), height=P(type='integer', default=1080),
+                                map=P(type='string'), connect=P(type='string'), renderer=P(type='string'),
+                                preset=P(type='array', items=P(type='string')), cvars=P(type='object'),
+                                audio=P(type='boolean', default=False), vk_debug=P(type='boolean', default=False),
+                                extra=P(type='array', items=P(type='string')))),
+     'annotations': ACT},
+    {'name': 'quit', 'title': 'End a client', 'description': 'End a client (all: every client and the server).',
+     'inputSchema': schema(dict(CLIENT, all=P(type='boolean', default=False))),
+     'annotations': {'readOnlyHint': False, 'destructiveHint': True, 'idempotentHint': True, 'openWorldHint': False}},
+    {'name': 'server_launch', 'title': 'Start a local server',
+     'description': 'Start the dedicated server (no window) on map, for clients to connect=localhost. gametype: g_gametype '
+                    '(0 FFA, 3 duel, 6 team FFA, 7 siege, 8 CTF). Its console: console with server=true.',
+     'inputSchema': schema(P(map=P(type='string'), gametype=P(type='integer', default=0), port=P(type='integer'),
+                             cvars=P(type='object'), extra=P(type='array', items=P(type='string'))), ['map']),
+     'annotations': ACT},
+    {'name': 'server_quit', 'title': 'End the server', 'description': 'End the dedicated server.', 'inputSchema': schema(),
+     'annotations': {'readOnlyHint': False, 'destructiveHint': True, 'idempotentHint': True, 'openWorldHint': False}},
     {'name': 'console', 'title': 'Console command',
-     'description': 'Run console commands (one a line) and return what the game printed after them. until: a regular expression; '
-                    'returns as soon as a printed line matches it (or after timeout seconds). Without until it waits wait seconds.',
-     'inputSchema': schema({'command': {'type': 'string'}, 'wait': {'type': 'number', 'default': 0.5},
-                            'until': {'type': 'string'}, 'timeout': {'type': 'number', 'default': 10}}, ['command']),
+     'description': 'Run console commands (one a line) and return what was printed after them. until: a regular expression; '
+                    'returns as soon as a printed line matches it (or after timeout seconds). Without until it waits wait '
+                    'seconds. server=true: the console of the dedicated server.',
+     'inputSchema': schema(dict(CLIENT, command=P(type='string'), wait=P(type='number', default=0.5), until=P(type='string'),
+                                timeout=P(type='number', default=10), server=P(type='boolean', default=False)), ['command']),
+     'annotations': ACT},
+    {'name': 'wait', 'title': 'Wait for a state',
+     'description': 'Wait until: kind=ingame (the level is loaded and the player plays; join=true picks team free and closes '
+                    'the menus), kind=log (a printed line matches pattern), kind=cvar (name has value), kind=time (the game '
+                    'clock went on by ms; not frames, the frame rate changes).',
+     'inputSchema': schema(dict(CLIENT, kind=P(type='string', enum=['ingame', 'log', 'cvar', 'time']), pattern=P(type='string'),
+                                name=P(type='string'), value=P(type='string'), ms=P(type='integer'), join=P(type='boolean', default=True),
+                                timeout=P(type='number', default=60), server=P(type='boolean', default=False)), ['kind']),
      'annotations': ACT},
     {'name': 'screenshot', 'title': 'Screenshot',
-     'description': 'Picture of the game window now, as JPEG. max_width shrinks it (0: full size); pixel coordinates of the other '
-                    'tools always refer to the full window size.',
-     'inputSchema': schema({'max_width': {'type': 'integer', 'default': 1280}, 'quality': {'type': 'integer', 'default': 85}}),
+     'description': 'Picture of the window now, as JPEG. crop [x,y,w,h] or around a point of the level [x,y,z] (size [w,h]), '
+                    'zoom, max_width (0: full size). Returns an id for compare. Pixel coordinates always refer to the full window.',
+     'inputSchema': schema(dict(CLIENT, max_width=P(type='integer', default=1280), quality=P(type='integer', default=85), **FRAME)),
      'annotations': RO},
+    {'name': 'sequence', 'title': 'Screenshots at game times',
+     'description': 'Several screenshots at game times after now (at_ms, e.g. [0, 100, 250, 500]), side by side in one '
+                    'picture; while they are taken the buttons of hold run if given (e.g. ["+attack"]). crop/around/zoom as '
+                    'for screenshot (around is projected once, at the start).',
+     'inputSchema': schema(dict(CLIENT, at_ms=P(type='array', items=P(type='integer')), hold=P(type='array', items=P(type='string')),
+                                max_width=P(type='integer', default=1600), **FRAME), ['at_ms']),
+     'annotations': ACT},
+    {'name': 'compare', 'title': 'Two screenshots side by side',
+     'description': 'Two screenshots of this session (ids from screenshot or sequence) side by side, cropped the same if crop is given.',
+     'inputSchema': schema(P(a=P(type='string'), b=P(type='string'), crop=FRAME['crop'], zoom=FRAME['zoom'],
+                             max_width=P(type='integer', default=1600)), ['a', 'b']),
+     'annotations': RO},
+    {'name': 'state', 'title': 'Player, view and entities',
+     'description': 'The level as the cgame sees it (VisionJK v_levelDump): game time, own player (origin, velocity, angles, '
+                    'health, weapon, third person), the view (origin, angles, fov, rect) and the entities within radius of the '
+                    'view (type, origin, distance, model). format concise or json.',
+     'inputSchema': schema(dict(CLIENT, radius=P(type='number', default=1024), format=P(type='string', enum=['concise', 'json'], default='concise'))),
+     'annotations': RO},
+    {'name': 'project', 'title': 'World points to window pixels',
+     'description': 'Where points of the level ([[x,y,z], ...]) are on the window, in pixels (null: behind the view).',
+     'inputSchema': schema(dict(CLIENT, points=P(type='array', items=P(type='array', items=P(type='number'))))),
+     'annotations': RO},
+    {'name': 'hold', 'title': 'Hold buttons',
+     'description': 'Press buttons (e.g. ["+forward", "+attack", "+v_water"], "+" commands) for ms of game time (the clock '
+                    'of the cgame, not frames), then let them go.',
+     'inputSchema': schema(dict(CLIENT, buttons=P(type='array', items=P(type='string')), ms=P(type='integer', default=500), **SHOT), ['buttons']),
+     'annotations': ACT},
+    {'name': 'view', 'title': 'Place the player',
+     'description': 'Put the player at origin [x,y,z] looking at yaw (and pitch), without the push of a teleport (setviewpos '
+                    '... still; needs cheats, e.g. launch map=). third: third person on/off, range/angle for its camera.',
+     'inputSchema': schema(dict(CLIENT, origin=P(type='array', items=P(type='number')), yaw=P(type='number', default=0),
+                                pitch=P(type='number', default=0), third=P(type='boolean'), range=P(type='number'),
+                                angle=P(type='number'), **SHOT)),
+     'annotations': ACT},
+    {'name': 'audio', 'title': 'Record the sound',
+     'description': 'Record seconds of the sound of a client launched with audio=true and return its loudness (dBFS) and the '
+                    'strongest frequencies per window. While it records, the buttons of hold run if given.',
+     'inputSchema': schema(dict(CLIENT, seconds=P(type='number', default=2), window_ms=P(type='integer', default=100),
+                                hold=P(type='array', items=P(type='string')))),
+     'annotations': ACT},
     {'name': 'menu_dump', 'title': 'List menu items',
      'description': 'The open menus and their visible items: name, type, rect x,y,w,h in window pixels, flags (F focus, M mouse over, '
                     'D decoration, X disabled), cvar=value and text. filter: only items whose name, text or cvar contains it. '
                     'format: "concise" (one line per item, default) or "json" (also as structuredContent).',
-     'inputSchema': schema({'filter': {'type': 'string'}, 'format': {'type': 'string', 'enum': ['concise', 'json'], 'default': 'concise'},
-                            'decorations': {'type': 'boolean', 'default': False, 'description': 'include items flagged D'}}),
+     'inputSchema': schema(dict(CLIENT, filter=P(type='string'), format=P(type='string', enum=['concise', 'json'], default='concise'),
+                                decorations=P(type='boolean', default=False, description='include items flagged D'))),
      'annotations': RO},
     {'name': 'mouse', 'title': 'Mouse',
      'description': 'Move the menu pointer to x, y (window pixels) and optionally click, hold, release, wheelup or wheeldown there.',
-     'inputSchema': schema(dict({'x': {'type': 'number'}, 'y': {'type': 'number'},
-                                 'action': {'type': 'string', 'enum': ['move', 'click', 'hold', 'release', 'wheelup', 'wheeldown'], 'default': 'move'}},
+     'inputSchema': schema(dict(CLIENT, x=P(type='number'), y=P(type='number'),
+                                action=P(type='string', enum=['move', 'click', 'hold', 'release', 'wheelup', 'wheeldown'], default='move'),
                                 **SHOT), ['x', 'y']),
      'annotations': ACT},
     {'name': 'click', 'title': 'Click item',
      'description': 'Click the middle of a menu item found by its exact name or text, else the first item whose text contains the words '
                     '(topmost menu first). menu: limit the search to one menu.',
-     'inputSchema': schema(dict({'item': {'type': 'string'}, 'menu': {'type': 'string'}}, **SHOT), ['item']),
+     'inputSchema': schema(dict(CLIENT, item=P(type='string'), menu=P(type='string'), **SHOT), ['item']),
      'annotations': ACT},
     {'name': 'key', 'title': 'Key or text',
      'description': 'Press a key in the menus, key: one character or one of ' + ', '.join(sorted(KEYS)) + '. text: type a string '
                     'into the focused field. Both may be given (key first).',
-     'inputSchema': schema(dict({'key': {'type': 'string'}, 'text': {'type': 'string'}}, **SHOT)),
+     'inputSchema': schema(dict(CLIENT, key=P(type='string'), text=P(type='string'), **SHOT)),
      'annotations': ACT},
     {'name': 'reload', 'title': 'Rebuild and reload',
-     'description': 'Rebuild from source and load into the running game. menus: menu build, copy the menu files where the game reads '
-                    'them first, ui_load. modules: module build, put the libraries in place (copy and rename), vid_restart.',
-     'inputSchema': schema({'what': {'type': 'string', 'enum': ['menus', 'modules']}}, ['what']),
+     'description': 'Rebuild from source and load into the running clients. menus: menu build, loose menu files, ui_load. modules: '
+                    'ui/cgame/game libraries, vid_restart. renderer: renderer libraries, vid_restart (rebuild modules too when '
+                    'shared structures changed). engine: the executable, the clients are relaunched keeping map, place and view. '
+                    'Files are put in place by copy and rename.',
+     'inputSchema': schema(P(what=P(type='string', enum=['menus', 'modules', 'renderer', 'engine']))),
+     'annotations': {'readOnlyHint': False, 'destructiveHint': False, 'idempotentHint': True, 'openWorldHint': False}},
+    {'name': 'relaunch', 'title': 'Restart a client in place',
+     'description': 'Restart a client with the same launch options, back on its map at its place and view (needs a level loaded with '
+                    'map=), keeping the cvars named in keep.',
+     'inputSchema': schema(dict(CLIENT, keep=P(type='array', items=P(type='string')))),
+     'annotations': ACT},
+    {'name': 'prepare', 'title': 'Make the test game folder',
+     'description': 'Build the game folder of the configuration (game_dir) from prepare.link (symlinks, e.g. the base pk3s) and '
+                    'prepare.copy (real copies of the executable, renderers, modules; the engine loads the renderer from next to '
+                    'its real path). Never writes into the source folders. No client may run.',
+     'inputSchema': schema(),
      'annotations': {'readOnlyHint': False, 'destructiveHint': False, 'idempotentHint': True, 'openWorldHint': False}},
     {'name': 'log', 'title': 'Game output',
-     'description': 'Lines the game printed: the last "lines", or with since (the cursor a previous call returned) only the newer ones.',
-     'inputSchema': schema({'lines': {'type': 'integer', 'default': 60}, 'since': {'type': 'integer'}}),
+     'description': 'Lines the game printed: the last "lines", with since (the cursor a previous call returned) only newer ones, '
+                    'with pattern only matching ones (e.g. "VULKAN" for the validation layers).',
+     'inputSchema': schema(dict(CLIENT, lines=P(type='integer', default=60), since=P(type='integer'), pattern=P(type='string'),
+                                server=P(type='boolean', default=False))),
      'annotations': RO},
 ]
 
@@ -421,10 +791,12 @@ def run_commands(cfg, commands):
     out = []
     cwd = cfg['reload'].get('cwd') or None
     for argv in commands:
-        r = subprocess.run(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
-        out.append('$ %s (exit %d)\n%s' % (' '.join(argv), r.returncode, r.stdout[-3000:]))
+        r = subprocess.run(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=1800)
         if r.returncode != 0:
+            out.append('$ %s (exit %d)\n%s' % (' '.join(argv), r.returncode, r.stdout[-4000:]))
             raise RuntimeError('\n'.join(out))
+        warnings = len(re.findall(r'warning:', r.stdout))
+        out.append('$ %s (exit 0%s)' % (' '.join(argv), ', %d warnings' % warnings if warnings else ''))
     return '\n'.join(out)
 
 
@@ -453,27 +825,357 @@ def concise(d, flt, decorations):
     return '\n'.join(out)
 
 
+def level_text(d):
+    fmt = lambda v: ','.join('%g' % x for x in v) if isinstance(v, list) else str(v)  # noqa: E731
+    out = []
+    for k in ('time', 'player', 'view'):
+        if k in d:
+            out.append('%s %s' % (k, ' '.join('%s=%s' % (kk, fmt(vv)) for kk, vv in d[k].items())))
+    for e in sorted(d['entities'], key=lambda e: e.get('dist', 0)):
+        out.append('  #%s %s %s dist=%s weapon=%s %s' % (e.get('num'), e.get('type'), fmt(e.get('origin', [])), e.get('dist'),
+                                                       e.get('weapon'), e.get('model')))
+    return '\n'.join(out)
+
+
 def after(game, a, msg):
     out = [text(msg)]
     if a.get('screenshot'):
-        time.sleep(0.25)    # (a few frames for the menu to answer)
-        out.append(image_content(game.screenshot(), 1280, 85))
+        time.sleep(0.25)    # (a few frames for the game to answer)
+        data = game.screenshot()
+        sid = keep_shot(data, '%s %s' % (game.name, msg[:40]))
+        out[0] = text('%s (screenshot %s)' % (msg, sid))
+        out.append(image_content(data, 1280, 85))
     return out
 
 
-def call(game, cfg, name, a):
+def press(game, buttons, down):
+    cmds = []
+    for b in buttons:
+        b = b.strip()
+        if not b:
+            continue
+        name = b[1:] if b[0] in '+-' else b
+        cmds.append(('+' if down else '-') + name)
+    if cmds:
+        game.send('\n'.join(cmds))
+
+
+def wait_ingame(game, join, timeout):
+    """Until the level is loaded and the player plays: team free and the menus closed when join."""
+    end = time.time() + timeout
+    joined = 0.0        # when team free went out last: again every 3 s (one sent while connecting gets lost)
+    last = None
+    while time.time() < end:
+        if not game.running():
+            raise RuntimeError('%s ended:\n%s' % (game.label(), game.tail(20)[0]))
+        try:
+            d = game.level(0)
+        except RuntimeError:
+            time.sleep(0.5)
+            continue
+        last = d
+        if d['player'].get('spectating', 1) == 0 and d['time'].get('server', 0) > 0:
+            if join:
+                try:
+                    if game.dump()['menus']:
+                        game.send('v_uiKey 27')
+                        time.sleep(0.3)
+                        continue
+                except RuntimeError:
+                    pass
+            return d
+        if join and time.time() - joined > 3.0:
+            game.send('team free')
+            joined = time.time()
+        elif join:
+            try:
+                if game.dump()['menus']:
+                    game.send('v_uiKey 27')
+            except RuntimeError:
+                pass
+        time.sleep(0.5)
+    raise RuntimeError('not in the game after %ds%s' % (timeout, '' if last is None else ': ' + level_text(last).splitlines()[1]))
+
+
+def do_reload(cfg, what):
+    r = cfg['reload']
+    out = []
+    clients = [g for k, g in GAMES.items() if not g.server and g.running()]
+    if what == 'menus':
+        out.append(run_commands(cfg, r.get('menus') or []))
+        pairs = r.get('menus_copy') or []
+        if pairs and isinstance(pairs[0], str):
+            pairs = [pairs]     # (one [source, destination] or a list of them)
+        for g in clients or [Game(cfg)]:
+            for src, dst in pairs:
+                dst = os.path.join(g.home, cfg['fs_game'], dst)
+                n = 0
+                for root, _, files in os.walk(src):
+                    for f in files:
+                        rel = os.path.relpath(os.path.join(root, f), src)
+                        put_file(os.path.join(root, f), os.path.join(dst, rel))
+                        n += 1
+                out.append('copied %d files to %s' % (n, dst))
+        for src, dst in r.get('menus_put') or []:
+            put_file(src, os.path.join(os.path.abspath(cfg['game_dir']), dst))
+            out.append('put %s (read at the next launch)' % dst)
+        for g in clients:
+            out.append('%s: %s' % (g.name, '\n'.join(g.command('ui_load', 2.0)[-10:])))
+        return '\n'.join(out)
+    out.append(run_commands(cfg, r.get(what) or []))
+    for src, dst in r.get(what + '_copy') or []:
+        put_file(src, os.path.join(os.path.abspath(cfg['game_dir']), dst))
+        out.append('put %s' % dst)
+    if what in ('modules', 'renderer'):
+        for g in clients:
+            out.append('%s: %s' % (g.name, '\n'.join(g.command('vid_restart', 5.0)[-10:])))
+    elif what == 'engine':
+        for g in clients:
+            out.append(relaunch(cfg, g, []))
+    return '\n'.join(out)
+
+
+def relaunch(cfg, game, keep):
+    """The same client again with the same options, on its map at its place and view, with the cvars of keep."""
+    opts = dict(game.opts)
+    place = None
+    values = {}
+    if game.running():
+        for name in keep or []:
+            v = game.cvar(name)
+            if v is not None:
+                values[name] = v
+        try:
+            d = game.level(0)
+            if d['time'].get('server', 0) > 0:
+                place = d
+                if not opts.get('map') and not opts.get('connect'):
+                    opts['map'] = d['time'].get('map')
+        except RuntimeError:
+            pass
+        game.stop()
+    opts['cvars'] = dict(opts.get('cvars') or {}, **values)
+    msg = [game.start(opts)]
+    if place and (opts.get('map') or opts.get('connect')):
+        wait_ingame(game, True, 90)
+        p, ang = place['player']['origin'], place['player']['angles']
+        msg.append(place_player(game, p, ang[1], ang[0]))
+    if values:
+        # (again in the game: a cgame may set its cvars when it loads)
+        game.send('\n'.join('set %s "%s"' % kv for kv in values.items()))
+        msg.append('kept ' + ', '.join('%s=%s' % kv for kv in values.items()))
+    return '; '.join(msg)
+
+
+def place_player(game, origin, yaw, pitch, timeout=3.0):
+    """setviewpos without the push of a teleport, and wait until the snapshots of the server show the player there."""
+    lines = game.command('setviewpos %g %g %g %g %g still' % (origin[0], origin[1], origin[2], yaw, pitch), 0.2)
+    bad = [line for line in lines if 'usage' in line.lower() or 'cheat' in line.lower()]
+    if bad:
+        raise RuntimeError('setviewpos: ' + ' | '.join(bad) + ' (cheats: launch with map=, or sv_cheats 1 on the server)')
+    end = time.time() + timeout
+    while time.time() < end:
+        o = game.level(0)['player']['origin']
+        if all(abs(o[i] - origin[i]) < 4.0 for i in range(3)):
+            return 'at %g %g %g, yaw %g pitch %g' % (origin[0], origin[1], origin[2], yaw, pitch)
+        time.sleep(0.05)
+    return 'sent the player to %g %g %g (not there after %gs: blocked, or falling)' % (origin[0], origin[1], origin[2], timeout)
+
+
+def prepare(cfg):
+    if any(g.running() for g in GAMES.values()):
+        raise RuntimeError('quit the clients and the server first')
+    game_dir = os.path.abspath(cfg['game_dir'])
+    not_temporary(game_dir, 'game_dir')
+    p = cfg.get('prepare') or {}
+    sources = [os.path.realpath(entry[0]) for entry in (p.get('link') or [])]
+    for s in sources:
+        if game_dir == s or game_dir.startswith(s + os.sep):
+            raise RuntimeError('game_dir %s is inside the source folder %s: prepare never writes there' % (game_dir, s))
+    out = []
+    n = 0
+    for entry in p.get('link') or []:
+        src, dst = entry[0], entry[1]
+        pattern = entry[2] if len(entry) > 2 else '*'
+        dst = os.path.join(game_dir, dst)
+        os.makedirs(dst, exist_ok=True)
+        for f in sorted(glob.glob(os.path.join(src, pattern))):
+            link = os.path.join(dst, os.path.basename(f))
+            if os.path.islink(link) and os.path.realpath(link) == os.path.realpath(f):
+                continue
+            if os.path.lexists(link):
+                os.remove(link)
+            os.symlink(os.path.abspath(f), link)
+            n += 1
+    out.append('%d links' % n)
+    for src, dst in p.get('copy') or []:
+        put_file(src, os.path.join(game_dir, dst))
+        if os.access(src, os.X_OK):
+            os.chmod(os.path.join(game_dir, dst), os.stat(src).st_mode)
+        out.append('copied %s' % dst)
+    return 'prepared %s: %s' % (game_dir, ', '.join(out))
+
+
+def call(cfg, name, a):
     """Returns (content, structuredContent or None)."""
     if name == 'launch':
-        return [text(game.start(int(a.get('width', 1920)), int(a.get('height', 1080)), a.get('extra')))], None
+        g = game_of(cfg, a, create=True)
+        return [text(g.start(a))], None
     if name == 'quit':
-        return [text(game.stop())], None
+        if a.get('all'):
+            out = [g.stop() for g in GAMES.values() if g.proc]
+            return [text('; '.join(out) or 'nothing was running')], None
+        return [text(game_of(cfg, a).stop())], None
+    if name == 'server_launch':
+        g = game_of(cfg, a, create=True, server=True)
+        opts = dict(a)
+        opts['cvars'] = dict({'g_gametype': str(a.get('gametype', 0))}, **(a.get('cvars') or {}))
+        return [text(g.start(opts))], None
+    if name == 'server_quit':
+        return [text(game_of(cfg, a, server=True).stop())], None
     if name == 'console':
-        lines = game.command(a['command'], float(a.get('wait', 0.5)), a.get('until'), float(a.get('timeout', 10)))
+        g = game_of(cfg, a, server=bool(a.get('server')))
+        lines = g.command(a['command'], float(a.get('wait', 0.5)), a.get('until'), float(a.get('timeout', 10)))
         return [text('\n'.join(lines) or '(nothing printed)')], None
+    if name == 'wait':
+        g = game_of(cfg, a, server=bool(a.get('server')))
+        kind, timeout = a['kind'], float(a.get('timeout', 60))
+        if kind == 'ingame':
+            d = wait_ingame(g, a.get('join', True), timeout)
+            return [text('in the game: ' + '\n'.join(level_text(d).splitlines()[:3]))], None
+        if kind == 'log':
+            line = g.wait_for(a['pattern'], timeout)
+            if line is None:
+                raise RuntimeError('no line matched %r in %ds' % (a['pattern'], timeout))
+            return [text(line)], None
+        if kind == 'cvar':
+            end = time.time() + timeout
+            v = None
+            while True:
+                v = g.cvar(a['name'])
+                if v == str(a.get('value')):
+                    return [text('%s = %s' % (a['name'], v))], None
+                if time.time() >= end:
+                    break
+                time.sleep(0.25)
+            raise RuntimeError('%s is %r, not %r, after %ds' % (a['name'], v, a.get('value'), timeout))
+        if kind == 'time':
+            took = g.wait_game_ms(int(a.get('ms', 1000)), timeout)
+            return [text('the game clock went on by %d ms' % took)], None
+        raise RuntimeError('unknown kind %r' % kind)
     if name == 'screenshot':
-        return [image_content(game.screenshot(), int(a.get('max_width', 1280)), int(a.get('quality', 85)))], None
+        g = game_of(cfg, a)
+        rect, p = framing(g, a)
+        data = g.screenshot()
+        sid = keep_shot(data, g.name)
+        note = 'screenshot %s' % sid + (' (point at %d,%d)' % p if p else '')
+        return [text(note), image_content(data, int(a.get('max_width', 1280)), int(a.get('quality', 85)), rect,
+                                          float(a.get('zoom', 1)))], None
+    if name == 'sequence':
+        g = game_of(cfg, a)
+        rect, _ = framing(g, a)
+        at = sorted(int(t) for t in a['at_ms'])
+        if not at:
+            raise RuntimeError('at_ms is empty: give the game times, e.g. [0, 200, 400]')
+        start = g.game_time()
+        if a.get('hold'):
+            press(g, a['hold'], True)
+        shots = []
+        try:
+            for t in at:
+                while True:
+                    now = g.game_time()
+                    if now - start >= t:
+                        break
+                    time.sleep(0.005)
+                data = g.screenshot()
+                shots.append((now - start, data))
+        finally:
+            if a.get('hold'):
+                press(g, a['hold'], False)
+        ids = [keep_shot(d, '%s +%dms' % (g.name, t)) for t, d in shots]
+        ims = [picture(d, rect, float(a.get('zoom', 1))) for _, d in shots]
+        if ims[0] is None:
+            return [text('screenshots ' + ', '.join(ids) + ' (Pillow is missing: no picture)')], None
+        im = strip(ims, ['%s +%d ms' % (sid, t) for sid, (t, _) in zip(ids, shots)])
+        return [text('screenshots %s at %s ms of game time' % (', '.join(ids), ', '.join(str(t) for t, _ in shots))),
+                image_content(None, int(a.get('max_width', 1600)), 85, im=im)], None
+    if name == 'compare':
+        pics = []
+        for k in ('a', 'b'):
+            if a[k] not in SHOTS:
+                raise RuntimeError('no screenshot %r (there are %s)' % (a[k], ', '.join(SHOTS) or 'none'))
+            pics.append(picture(SHOTS[a[k]][0], a.get('crop'), float(a.get('zoom', 1))))
+        if pics[0] is None:
+            raise RuntimeError('compare needs Pillow (pip install pillow)')
+        im = strip(pics, ['%s %s' % (a[k], SHOTS[a[k]][1]) for k in ('a', 'b')])
+        return [image_content(None, int(a.get('max_width', 1600)), 85, im=im)], None
+    if name == 'state':
+        g = game_of(cfg, a)
+        d = g.level(a.get('radius', 1024))
+        if a.get('format') == 'json':
+            return [text(json.dumps(d))], d
+        return [text(level_text(d))], None
+    if name == 'project':
+        g = game_of(cfg, a)
+        res = []
+        for p in a.get('points') or []:
+            q = g.project(p)
+            res.append(None if q is None else [round(q[0], 1), round(q[1], 1)])
+        return [text(json.dumps(res))], {'pixels': res}
+    if name == 'hold':
+        g = game_of(cfg, a)
+        ms = int(a.get('ms', 500))
+        press(g, a['buttons'], True)
+        try:
+            took = g.wait_game_ms(ms)
+        finally:
+            press(g, a['buttons'], False)
+        return after(g, a, 'held %s for %d ms of game time' % (' '.join(a['buttons']), took)), None
+    if name == 'view':
+        g = game_of(cfg, a)
+        msg = []
+        if a.get('origin'):
+            msg.append(place_player(g, a['origin'], float(a.get('yaw', 0)), float(a.get('pitch', 0))))
+        cmds = []
+        if a.get('third') is not None:
+            cmds.append('cg_thirdPerson %d' % (1 if a['third'] else 0))
+        if a.get('range') is not None:
+            cmds.append('cg_thirdPersonRange %g' % a['range'])
+        if a.get('angle') is not None:
+            cmds.append('cg_thirdPersonAngle %g' % a['angle'])
+        if cmds:
+            g.send('\n'.join(cmds))
+            msg.append(', '.join(cmds))
+        return after(g, a, '; '.join(msg) or 'nothing to do'), None
+    if name == 'audio':
+        g = game_of(cfg, a)
+        if not g.audio_path:
+            raise RuntimeError('launch the client with audio=true first')
+        rate = 44100
+        for line in list(g.lines):
+            m = re.search(r'Freq:\s+(\d+)', line)
+            if m:
+                rate = int(m.group(1))
+        start = os.path.getsize(g.audio_path) if os.path.exists(g.audio_path) else 0
+        if a.get('hold'):
+            press(g, a['hold'], True)
+        try:
+            time.sleep(float(a.get('seconds', 2)))
+        finally:
+            if a.get('hold'):
+                press(g, a['hold'], False)
+        with open(g.audio_path, 'rb') as f:
+            f.seek(start)
+            raw = f.read()
+        rows, whole, peak = analyse_audio(raw, rate, int(a.get('window_ms', 100)))
+        out = ['%.2f s at %d Hz: loudness %.1f dBFS, peak %.1f dBFS' % (len(raw) / 4.0 / rate, rate, whole, peak)]
+        for t, db, top in rows:
+            out.append('%6.2f s %6.1f dB  %s' % (t, db, ', '.join('%.0f Hz' % f for f in top) if top else '-'))
+        return [text('\n'.join(out))], None
     if name == 'menu_dump':
-        d = game.dump()
+        g = game_of(cfg, a)
+        d = g.dump()
         flt = (a.get('filter') or '').lower()
         if a.get('format') == 'json':
             for menu in d['menus']:
@@ -483,18 +1185,21 @@ def call(game, cfg, name, a):
             return [text(json.dumps(d))], d
         return [text(concise(d, flt, a.get('decorations')))], None
     if name == 'mouse':
+        g = game_of(cfg, a)
         action = '' if a.get('action') in (None, '', 'move') else a['action']
-        game.send('v_uiMouse %s %s %s px' % (a['x'], a['y'], action))
+        g.send('v_uiMouse %s %s %s px' % (a['x'], a['y'], action))
         time.sleep(0.15)
-        return after(game, a, 'pointer at %s,%s %s' % (a['x'], a['y'], action or 'moved')), None
+        return after(g, a, 'pointer at %s,%s %s' % (a['x'], a['y'], action or 'moved')), None
     if name == 'click':
-        menu, item = find_item(game, a['item'], a.get('menu'))
+        g = game_of(cfg, a)
+        menu, item = find_item(g, a['item'], a.get('menu'))
         x, y, w, h = item['rect']
-        game.send('v_uiMouse %d %d click px' % (round(x + w / 2), round(y + h / 2)))
+        g.send('v_uiMouse %d %d click px' % (round(x + w / 2), round(y + h / 2)))
         time.sleep(0.2)
-        return after(game, a, 'clicked %s %s of %s at %d,%d' % (item['name'], json.dumps(item['text']), menu['name'],
-                                                                 x + w / 2, y + h / 2)), None
+        return after(g, a, 'clicked %s %s of %s at %d,%d' % (item['name'], json.dumps(item['text']), menu['name'],
+                                                              x + w / 2, y + h / 2)), None
     if name == 'key':
+        g = game_of(cfg, a)
         sent = []
         if a.get('key'):
             k = a['key']
@@ -503,47 +1208,24 @@ def call(game, cfg, name, a):
                 num = ord(k)
             if num is None:
                 raise RuntimeError('unknown key %r; use one character or one of %s' % (k, ', '.join(sorted(KEYS))))
-            game.send('v_uiKey %d' % num)
+            g.send('v_uiKey %d' % num)
             sent.append(k)
         if a.get('text'):
-            game.send('\n'.join('v_uiKey %d char' % ord(ch) for ch in a['text']))
+            g.send('\n'.join('v_uiKey %d char' % ord(ch) for ch in a['text']))
             sent.append(json.dumps(a['text']))
         time.sleep(0.15)
-        return after(game, a, 'pressed ' + ' '.join(sent)), None
+        return after(g, a, 'pressed ' + ' '.join(sent)), None
     if name == 'reload':
-        r = cfg['reload']
-        out = []
-        if a['what'] == 'menus':
-            out.append(run_commands(cfg, r.get('menus') or []))
-            pairs = r.get('menus_copy') or []
-            if pairs and isinstance(pairs[0], str):
-                pairs = [pairs]     # (one [source, destination] or a list of them)
-            for src, dst in pairs:
-                dst = os.path.join(os.path.abspath(cfg['home']), cfg['fs_game'], dst)
-                n = 0
-                for root, _, files in os.walk(src):
-                    for f in files:
-                        rel = os.path.relpath(os.path.join(root, f), src)
-                        put_file(os.path.join(root, f), os.path.join(dst, rel))
-                        n += 1
-                out.append('copied %d files to %s' % (n, dst))
-            for src, dst in r.get('menus_put') or []:
-                put_file(src, os.path.join(os.path.abspath(cfg['game_dir']), dst))
-                out.append('put %s (read at the next launch)' % dst)
-            if game.running():
-                out.append('\n'.join(game.command('ui_load', 2.0)[-20:]))
-        else:
-            out.append(run_commands(cfg, r.get('modules') or []))
-            for src, dst in r.get('modules_copy') or []:
-                put_file(src, os.path.join(os.path.abspath(cfg['game_dir']), dst))
-                out.append('put %s' % dst)
-            if game.running():
-                out.append('\n'.join(game.command('vid_restart', 4.0)[-20:]))
-        return [text('\n'.join(out))], None
+        return [text(do_reload(cfg, a['what']))], None
+    if name == 'relaunch':
+        return [text(relaunch(cfg, game_of(cfg, a), a.get('keep') or []))], None
+    if name == 'prepare':
+        return [text(prepare(cfg))], None
     if name == 'log':
+        g = game_of(cfg, a, server=bool(a.get('server')))
         since = a.get('since')
-        body, cursor = game.tail(int(a.get('lines', 60)), int(since) if since is not None else None)
-        return [text('%s\n(cursor %d)' % (body, cursor))], None
+        body, cursor = g.tail(int(a.get('lines', 60)), int(since) if since is not None else None, a.get('pattern'))
+        return [text('%s\n(cursor %d)' % (body or '(no lines)', cursor))], None
     raise KeyError(name)
 
 
@@ -551,7 +1233,6 @@ def call(game, cfg, name, a):
 
 def main():
     cfg = load_config()
-    game = Game(cfg)
     out = sys.stdout
 
     def reply(msg_id, result=None, error=None):
@@ -589,7 +1270,7 @@ def main():
                 reply(msg_id, error={'code': -32602, 'message': 'unknown tool %s' % name})
                 continue
             try:
-                content, structured = call(game, cfg, name, params.get('arguments') or {})
+                content, structured = call(cfg, name, params.get('arguments') or {})
                 result = {'content': content, 'isError': False}
                 if structured is not None:
                     result['structuredContent'] = structured
@@ -598,7 +1279,8 @@ def main():
                 reply(msg_id, {'content': [text('%s: %s' % (type(e).__name__, e))], 'isError': True})
         else:
             reply(msg_id, error={'code': -32601, 'message': 'unknown method %s' % method})
-    game.stop()
+    for g in list(GAMES.values()):
+        g.stop()
 
 
 if __name__ == '__main__':
