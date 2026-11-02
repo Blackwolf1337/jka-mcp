@@ -113,9 +113,11 @@ Most tools take `client` (default `main`) to pick one of several running clients
 
 `view` reads the current yaw and pitch from `v_levelDump` for the one that is not given. It sends `setviewpos x y z yaw pitch still` (without `still` when `still` is false) and waits up to 3 seconds until the snapshots of the server show the player there. It needs cheats. `third` sets `cg_thirdPerson`, `range` sets `cg_thirdPersonRange`, `angle` sets `cg_thirdPersonAngle`.
 
-`reload` with `menus` runs the menu build, copies the menu files, puts the pk3 and runs `ui_load`. With `modules` it runs the module build, puts the libraries in place and runs `vid_restart`. `renderer` does the same with the renderer libraries. With `engine` the clients are relaunched like `relaunch` does. If no client runs, only the build and copy steps happen.
+`reload` with `menus` runs the menu build, copies the menu files, puts the pk3 and runs `ui_load`, then opens the menus that were open before again (`main` when none was open and no level is loaded). With `modules` it runs the module build, puts the libraries in place and runs `vid_restart`. `renderer` does the same with the renderer libraries. With `engine` the clients are relaunched like `relaunch` does. If no client runs, only the build and copy steps happen.
 
 `relaunch` keeps the map, the place and the view, and the cvars named in `keep`, which are set again after the level loads.
+
+`reload` and `prepare` read `jka-mcp.json` again, so a changed configuration counts without reconnecting the server.
 
 `prepare` refuses to run while a client or the server runs, refuses `/tmp`, and refuses a `game_dir` inside a link source folder. It never writes into the source folders. It writes `jkamcp_prepared.json` in `game_dir`, a list of what it made. On the next run it removes only the files and links from that list that the config no longer names. It never removes anything else.
 

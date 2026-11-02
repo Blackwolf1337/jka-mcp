@@ -934,7 +934,7 @@ def do_reload(cfg, what):
             put_file(src, os.path.join(os.path.abspath(cfg['game_dir']), dst))
             out.append('put %s (read at the next launch)' % dst)
         for g in clients:
-            out.append('%s: %s' % (g.name, '\n'.join(g.command('ui_load', 2.0)[-10:])))
+            out.append('%s: %s' % (g.name, ui_load(g)))
         return '\n'.join(out)
     out.append(run_commands(cfg, r.get(what) or []))
     for src, dst in r.get(what + '_copy') or []:
@@ -946,6 +946,42 @@ def do_reload(cfg, what):
     elif what == 'engine':
         for g in clients:
             out.append(relaunch(cfg, g, []))
+    return '\n'.join(out)
+
+
+def ui_load(game):
+    """ui_load closes the menus: the ones open before are opened again (the focused one last, on its page), "main"
+    when none was open and no level is loaded (the window stays black otherwise)."""
+    try:
+        before = game.dump()['menus']
+    except RuntimeError:
+        before = None
+    out = game.command('ui_load', 2.0)[-10:]
+    if before is None:
+        return '\n'.join(out)
+    shown = lambda ms: [(m['name'], m.get('page')) for m in ms]
+    try:
+        now = game.dump()['menus']
+    except RuntimeError:
+        return '\n'.join(out)
+    if shown(now) == shown(before) and (now or before):
+        return '\n'.join(out)
+    menus = sorted(before, key=lambda m: m.get('focus') == '1')
+    if not menus:
+        try:
+            game.level(0)
+            return '\n'.join(out)
+        except RuntimeError:
+            menus = [{'name': 'main'}]
+    cmds = []
+    for i, m in enumerate(menus):
+        cmds.append('ui_openmenu %s%s' % (m['name'], ' over' if i else ''))
+        # (v_uiPage turns the focused menu: the one just opened)
+        if m.get('page', '0') != '0':
+            cmds.append('v_uiPage %s' % m['page'])
+    game.send('\n'.join(cmds))
+    time.sleep(0.3)
+    out.append('open menus: ' + (', '.join(m['name'] for m in game.dump()['menus']) or 'none'))
     return '\n'.join(out)
 
 
@@ -964,7 +1000,13 @@ def relaunch(cfg, game, keep):
             if d['time'].get('server', 0) > 0:
                 place = d
                 if not opts.get('map') and not opts.get('connect'):
-                    opts['map'] = d['time'].get('map')
+                    # (the level names it maps/mp/ffa3.bsp, devmap wants mp/ffa3)
+                    m = d['time'].get('map') or ''
+                    if m.startswith('maps/'):
+                        m = m[5:]
+                    if m.endswith('.bsp'):
+                        m = m[:-4]
+                    opts['map'] = m
         except RuntimeError:
             pass
         game.stop()
@@ -1273,6 +1315,12 @@ def call(cfg, name, a):
             sent.append(json.dumps(a['text']))
         time.sleep(0.15)
         return after(g, a, 'pressed ' + ' '.join(sent)), None
+    if name in ('reload', 'prepare'):
+        # (the configuration read again: a changed jka-mcp.json counts without reconnecting the server; in place, the
+        # clients keep a reference to it)
+        fresh = load_config()
+        cfg.clear()
+        cfg.update(fresh)
     if name == 'reload':
         return [text(do_reload(cfg, a['what']))], None
     if name == 'relaunch':
