@@ -3,16 +3,21 @@
 window and lets an AI assistant test it: menus (a dump of their items, mouse, keys), gameplay (held buttons timed
 by the game clock, the view, a dump of the level, world points projected to the screen), screenshots (cropped,
 zoomed, in sequences, side by side), sound (recorded and measured), several clients and a local dedicated server,
-and rebuilding menus, modules, the renderer or the engine into the running game.
+real mouse and key input (XTEST) for windows the ui module does not own, and rebuilding menus, modules, the renderer
+or the engine into the running game.
 
 Clients run in gamescope's headless backend (no window). The server speaks the Model Context Protocol over stdio
 (JSON-RPC 2.0, one message a line) and needs only the Python standard library; Pillow makes screenshots smaller and
 does crops, sequences and comparisons, numpy does the analysis of sound.
 
 Configuration: a JSON file named by JKA_MCP_CONFIG (default: jka-mcp.json next to this file), keys see CONFIG below.
+The tool configure changes it for this server process only (every MCP client session runs its own), never the file.
 """
 import base64
 import collections
+import ctypes
+import ctypes.util
+import errno
 import glob
 import io
 import json
@@ -20,18 +25,21 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
 
-VERSION = '0.2.0'
+VERSION = '0.3.0'
 PROTOCOLS = ('2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05')
 
 INSTRUCTIONS = (
     'Drives Jedi Academy (VisionJK) clients without a window, and a local dedicated server. launch starts a client '
     '(name it with "client" to run several; the default is "main"), quit ends it. Coordinates are pixels of the game '
-    'window. Menus: menu_dump, click (by item name), key, mouse. Gameplay: launch with map= (devmap, cheats on) or '
+    'window. Menus: menu_dump, click (by item name), key, mouse. Windows of the cgame (e.g. VisionJK\'s drawing board) '
+    'get real input with input (pointer, buttons, wheel, keys with modifiers). configure points this server alone at '
+    'another build (e.g. a worktree) without touching the shared configuration file. Gameplay: launch with map= (devmap, cheats on) or '
     'connect=, then wait kind=ingame, hold for buttons timed by the game clock, view to place the player, state for '
     'the player and the entities, project for world points on the screen. screenshot can crop, zoom or frame a world '
     'point; sequence takes several at game times; compare puts two side by side. Pass screenshot=true to an action to '
@@ -53,7 +61,7 @@ CONFIG = {
     # cvars of every client launch: no console lines over the view (the dumps of the tools print there)
     'cvars': {'con_notifytime': '0'},
     'server_args': ['+set', 'sv_pure', '0', '+set', 'g_gametype', '0'],
-    'server_port': 29070,
+    'server_port': 29070,           # where server_launch starts looking for a free UDP port
     'renderer': 'rd-vulkan-vision', # cl_renderer, empty: the game's own choice
     'presets': {                    # named sets of cvars a launch can ask for (preset=[...])
         'msaa8': {'r_ext_multisample': '8'},
@@ -84,17 +92,50 @@ KEYS = {'shift': 1, 'ctrl': 2, 'alt': 3, 'backspace': 8, 'tab': 9, 'enter': 10, 
         'pageup': 145, 'end': 157, 'pagedown': 158, 'up': 170, 'down': 171, 'left': 172, 'right': 173}
 
 
-def load_config():
-    path = os.environ.get('JKA_MCP_CONFIG') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'jka-mcp.json')
+# what the tool configure changed for this process: another file, path prefixes replaced, keys set on top
+OVERRIDES = {'file': None, 'replace': {}, 'set': {}}
+
+
+def config_path(own=True):
+    """The configuration file: the one configure chose (own), else JKA_MCP_CONFIG, else jka-mcp.json next to this file."""
+    return ((own and OVERRIDES['file']) or os.environ.get('JKA_MCP_CONFIG')
+            or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'jka-mcp.json'))
+
+
+def merge(cfg, user):
+    for k, v in user.items():
+        if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+            cfg[k].update(v)
+        else:
+            cfg[k] = v
+
+
+def replaced(v, pairs):
+    """Every string of v that is one of the paths of pairs, or below one, with that part replaced (longest first)."""
+    if isinstance(v, str):
+        for old in sorted(pairs, key=len, reverse=True):
+            o = old.rstrip('/')
+            if v == o or v.startswith(o + '/'):
+                return pairs[old].rstrip('/') + v[len(o):]
+        return v
+    if isinstance(v, list):
+        return [replaced(x, pairs) for x in v]
+    if isinstance(v, dict):
+        return {k: replaced(x, pairs) for k, x in v.items()}
+    return v
+
+
+def load_config(own=True):
+    """The configuration as this process uses it; own=False: the file alone, as other sessions see it."""
+    path = config_path(own)
     cfg = json.loads(json.dumps(CONFIG))
     if os.path.exists(path):
         with open(path, encoding='utf-8') as f:
-            user = json.load(f)
-        for k, v in user.items():
-            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-                cfg[k].update(v)
-            else:
-                cfg[k] = v
+            merge(cfg, json.load(f))
+    if own and OVERRIDES['replace']:
+        cfg = replaced(cfg, OVERRIDES['replace'])
+    if own and OVERRIDES['set']:
+        merge(cfg, json.loads(json.dumps(OVERRIDES['set'])))
     if not cfg['home'] and cfg['game_dir']:
         cfg['home'] = os.path.join(os.path.dirname(os.path.abspath(cfg['game_dir'])), 'jka-mcp-home')
     if not cfg['log_file'] and cfg['home']:
@@ -107,6 +148,69 @@ def not_temporary(path, what):
     real = os.path.realpath(path)
     if real == '/tmp' or real.startswith('/tmp/') or real.startswith('/var/tmp/'):
         raise RuntimeError('%s must not be under /tmp (the client refuses game code from a temporary folder): %s' % (what, path))
+
+
+def own_sessions():
+    """The process sessions of the games of this server (each game runs in a session of its own)."""
+    return {g.proc.pid for g in GAMES.values() if g.running()}
+
+
+def foreign_processes(home=None, cwd=None):
+    """Processes of other sessions (other MCP servers, a game started by hand) that use home (fs_homepath) or run in cwd:
+    [(pid, command)]."""
+    own = own_sessions()
+    home = os.path.realpath(home) if home else None
+    cwd = os.path.realpath(cwd) if cwd else None
+    found = []
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            with open('/proc/%s/stat' % pid) as f:
+                # (after the command in parentheses: state, ppid, pgrp, session)
+                sid = int(f.read().rsplit(')', 1)[1].split()[3])
+            if sid in own:
+                continue
+            with open('/proc/%s/cmdline' % pid, 'rb') as f:
+                argv = [x.decode('utf-8', 'replace') for x in f.read().split(b'\0')]
+            hit = False
+            if home:
+                for i in range(len(argv) - 1):
+                    if argv[i] == 'fs_homepath' and os.path.realpath(argv[i + 1]) == home:
+                        hit = True
+            if cwd and not hit and 'fs_homepath' in argv:
+                hit = os.path.realpath('/proc/%s/cwd' % pid) == cwd
+            if hit:
+                found.append((int(pid), ' '.join(argv[:3])))
+        except (OSError, IndexError, ValueError):
+            continue
+    return found
+
+
+def port_free(port):
+    """Nobody has the UDP port (IPv4, and IPv6 where there is any)."""
+    for family, addr in ((socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')):
+        try:
+            s = socket.socket(family, socket.SOCK_DGRAM)
+        except OSError:
+            continue
+        try:
+            if family == socket.AF_INET6:
+                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            s.bind((addr, port))
+        except OSError as e:
+            if e.errno == errno.EADDRINUSE:
+                return False
+        finally:
+            s.close()
+    return True
+
+
+def free_port(start):
+    for port in range(int(start), int(start) + 200):
+        if port_free(port):
+            return port
+    raise RuntimeError('no free UDP port from %s to %s' % (start, int(start) + 199))
 
 
 class Game:
@@ -127,6 +231,8 @@ class Game:
         self.opts = {}
         self.audio_path = None
         self.audio_pos = 0
+        self.port = None            # the UDP port the server really has
+        self.pointer = None         # input: where the pointer of the window is, in 640x480 units from the top left
         base = os.path.abspath(cfg['home'])
         self.home = base if name == 'main' and not server else '%s-%s' % (base, 'server' if server else name)
 
@@ -158,6 +264,11 @@ class Game:
             raise RuntimeError('game_dir is not set or not a folder: %r (prepare makes one)' % cfg['game_dir'])
         not_temporary(game_dir, 'game_dir')
         not_temporary(self.home, 'home')
+        other = foreign_processes(home=self.home)
+        if other:
+            # (two games in one home overwrite each other's configuration and screenshots)
+            raise RuntimeError('another game uses the home %s (pid %d: %s), e.g. one of another session: name this client '
+                               'differently (client=) or give this server its own home (configure)' % ((self.home,) + other[0]))
         os.makedirs(os.path.join(self.home, cfg['fs_game']), exist_ok=True)
         if opts.get('map') and opts.get('connect'):
             raise RuntimeError('map= starts a level of its own, connect= joins a server: give one of them')
@@ -171,8 +282,16 @@ class Game:
         env = dict(os.environ)
         env.update({k: str(v) for k, v in (cfg.get('env') or {}).items()})
         if self.server:
+            # (the engine takes the next of 10 ports without a word when its own is taken: clients would join the
+            # server of another session there)
+            if opts.get('port'):
+                self.port = int(opts['port'])
+                if not port_free(self.port):
+                    raise RuntimeError('the UDP port %d is taken (another server?); leave port out for a free one' % self.port)
+            else:
+                self.port = free_port(cfg.get('server_port') or 29070)
             args = [cfg['server_binary'], '+set', 'fs_homepath', self.home, '+set', 'dedicated', '1',
-                    '+set', 'net_port', str(opts.get('port') or cfg.get('server_port', 29070))] + list(cfg.get('server_args') or [])
+                    '+set', 'net_port', str(self.port)] + list(cfg.get('server_args') or [])
         else:
             args = [cfg['binary'], '+set', 'fs_homepath', self.home, '+set', 'r_mode', '-1', '+set', 'r_customwidth', str(width),
                     '+set', 'r_customheight', str(height), '+set', 'r_fullscreen', '0']
@@ -207,7 +326,10 @@ class Game:
             # ("localhost" is the server inside the client's own process for the engine, not the one on the UDP port)
             where = opts['connect']
             if where.split(':')[0] in ('localhost', 'local'):
-                where = '127.0.0.1:%s' % (where.split(':')[1] if ':' in where else cfg.get('server_port', 29070))
+                # (the port of server_launch of this session)
+                srv = GAMES.get('#server')
+                port = srv.port if srv is not None and srv.running() and srv.port else cfg.get('server_port', 29070)
+                where = '127.0.0.1:%s' % (where.split(':')[1] if ':' in where else port)
             args += ['+connect', where]
         if not self.server and cfg['launcher'] == 'gamescope':
             for k in ('DISPLAY', 'WAYLAND_DISPLAY'):
@@ -239,7 +361,10 @@ class Game:
             raise RuntimeError('%s did not start:\n%s' % (self.label(), out))
         if self.server:
             self.wait_for(r'Server: |------ Server Initialization|ClientBegin|Hitch warning', 30, 0)
-            return '%s started (pid %d), port %s' % (self.label(), self.proc.pid, opts.get('port') or cfg.get('server_port', 29070))
+            real = self.cvar('net_port')
+            if real and real.isdigit():
+                self.port = int(real)
+            return '%s started (pid %d), port %d (connect=localhost joins it)' % (self.label(), self.proc.pid, self.port)
         if opts.get('map') or opts.get('connect'):
             return '%s started %dx%d (pid %d), loading %s; wait kind=ingame for the level' % (
                 self.label(), width, height, self.proc.pid, opts.get('map') or opts.get('connect'))
@@ -283,6 +408,7 @@ class Game:
                     pass
         code = self.proc.returncode
         self.proc = None
+        self.pointer = None
         if self.log:
             self.log.close()
             self.log = None
@@ -531,14 +657,18 @@ def picture(data, crop=None, zoom=1.0):
     return im
 
 
-def image_content(data, max_width=1280, quality=85, crop=None, zoom=1.0, im=None):
-    """A screenshot as MCP image content: cropped, zoomed, smaller and as JPEG where Pillow is there, else the PNG."""
+def image_content(data, max_width=1280, quality=85, crop=None, zoom=1.0, im=None, fit=False):
+    """A screenshot as MCP image content: cropped, zoomed, smaller and as JPEG where Pillow is there, else the PNG.
+    fit: a smaller picture is made as wide as max_width (as high, if it is higher than wide)."""
     if im is None:
         im = picture(data, crop, zoom)
     if im is None:
         return {'type': 'image', 'data': base64.b64encode(data).decode(), 'mimeType': 'image/png'}
     Image, _ = _pil()
-    if max_width and im.width > max_width:
+    if fit and max_width and max(im.width, im.height) < max_width:
+        f = max_width / float(max(im.width, im.height))
+        im = im.resize((round(im.width * f), round(im.height * f)), Image.LANCZOS)
+    elif max_width and im.width > max_width:
         im = im.resize((max_width, round(im.height * max_width / im.width)), Image.LANCZOS)
     buf = io.BytesIO()
     im.save(buf, 'JPEG', quality=quality)
@@ -578,11 +708,26 @@ def keep_shot(data, label):
 
 
 def framing(game, a):
-    """The rectangle a screenshot is cut to: crop=[x,y,w,h], or around=[x,y,z] (a point of the level) with size=[w,h]."""
+    """The rectangle a screenshot is cut to: crop=[x,y,w,h], or around=[x,y,z] (a point of the level) with size=[w,h]
+    in pixels, or with extent (world units): the box of that half size around the point, as large as it is on the
+    window."""
     if a.get('around'):
         p = game.project(a['around'])
         if p is None:
             raise RuntimeError('the point %s is behind the view' % (a['around'],))
+        if a.get('extent'):
+            e = float(a['extent'])
+            x, y, z = a['around']
+            corners = [game.project([x + dx, y + dy, z + dz]) for dx in (-e, e) for dy in (-e, e) for dz in (-e, e)]
+            corners = [c for c in corners if c is not None]
+            if not corners:
+                raise RuntimeError('the box around %s is behind the view' % (a['around'],))
+            x0, x1 = min(c[0] for c in corners), max(c[0] for c in corners)
+            y0, y1 = min(c[1] for c in corners), max(c[1] for c in corners)
+            # (a corner behind the view is left out: at least the point itself with a margin)
+            w, h = max(x1 - x0, 32.0), max(y1 - y0, 32.0)
+            x0, y0 = min(x0, p[0] - w / 2.0), min(y0, p[1] - h / 2.0)
+            return [x0, y0, w, h], p
         w, h = a.get('size') or [400, 300]
         return [p[0] - w / 2.0, p[1] - h / 2.0, w, h], p
     return a.get('crop'), None
@@ -619,6 +764,160 @@ def analyse_audio(raw, rate, window_ms=100, peaks=3):
     whole = float(np.sqrt(np.mean(mono * mono))) if len(mono) else 0.0
     peak = float(np.max(np.abs(a))) if len(a) else 0.0
     return rows, (20 * np.log10(whole) if whole > 1e-9 else -120.0), (20 * np.log10(peak) if peak > 1e-9 else -120.0)
+
+
+# ---- real input (XTEST) into the X display of a client's gamescope
+
+# the names the tool input takes for keys, as X keysyms (f1 to f12 and single characters by rule)
+XKEYS = {'enter': 'Return', 'return': 'Return', 'esc': 'Escape', 'escape': 'Escape', 'tab': 'Tab',
+         'backspace': 'BackSpace', 'delete': 'Delete', 'insert': 'Insert', 'space': 'space', 'up': 'Up', 'down': 'Down',
+         'left': 'Left', 'right': 'Right', 'home': 'Home', 'end': 'End', 'pageup': 'Prior', 'pagedown': 'Next',
+         'ctrl': 'Control_L', 'control': 'Control_L', 'shift': 'Shift_L', 'alt': 'Alt_L', 'console': 'grave'}
+XLIB = None
+
+
+def xlib():
+    """libX11 and libXtst through ctypes (gamescope needs both, so they are there where it is)."""
+    global XLIB
+    if XLIB is None:
+        try:
+            x11 = ctypes.CDLL(ctypes.util.find_library('X11') or 'libX11.so.6')
+            xtst = ctypes.CDLL(ctypes.util.find_library('Xtst') or 'libXtst.so.6')
+        except OSError as e:
+            raise RuntimeError('input needs libX11 and libXtst: %s' % e)
+        vp, ul, ci, cu = ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_uint
+        for name, res, args in (('XOpenDisplay', vp, [ctypes.c_char_p]), ('XCloseDisplay', ci, [vp]),
+                                ('XSync', ci, [vp, ci]), ('XStringToKeysym', ul, [ctypes.c_char_p]),
+                                ('XKeysymToKeycode', ctypes.c_ubyte, [vp, ul]),
+                                ('XkbKeycodeToKeysym', ul, [vp, ctypes.c_ubyte, ci, ci])):
+            getattr(x11, name).restype, getattr(x11, name).argtypes = res, args
+        for name, args in (('XTestFakeRelativeMotionEvent', [vp, ci, ci, ul]), ('XTestFakeButtonEvent', [vp, cu, ci, ul]),
+                           ('XTestFakeKeyEvent', [vp, cu, ci, ul])):
+            getattr(xtst, name).restype, getattr(xtst, name).argtypes = ci, args
+        # (Xlib's own handler of an error ends the whole process: this one only notes it)
+        handler = ctypes.CFUNCTYPE(ci, vp, vp)(lambda d, e: 0)
+        x11.XSetErrorHandler.restype, x11.XSetErrorHandler.argtypes = vp, [vp]
+        x11.XSetErrorHandler(ctypes.cast(handler, vp))
+        XLIB = (x11, xtst, handler)
+    return XLIB
+
+
+def game_environ(game):
+    """The environment of the game process itself (not of gamescope): its DISPLAY is gamescope's own X server."""
+    exe = os.path.basename(game.cfg['binary'])
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit():
+            continue
+        try:
+            with open('/proc/%s/stat' % pid) as f:
+                if int(f.read().rsplit(')', 1)[1].split()[3]) != game.proc.pid:
+                    continue
+            with open('/proc/%s/cmdline' % pid, 'rb') as f:
+                if os.path.basename(f.read().split(b'\0')[0].decode('utf-8', 'replace')) != exe:
+                    continue
+            with open('/proc/%s/environ' % pid, 'rb') as f:
+                env = dict(x.decode('utf-8', 'replace').partition('=')[::2] for x in f.read().split(b'\0') if b'=' in x)
+            if env.get('DISPLAY'):
+                return env
+        except (OSError, IndexError, ValueError):
+            continue
+    raise RuntimeError('found no %s with a DISPLAY under gamescope (pid %d)' % (exe, game.proc.pid))
+
+
+class XInput:
+    """One connection to the X display of a client, for the length of one call (it ends with the game)."""
+
+    def __init__(self, game):
+        if game.cfg['launcher'] != 'gamescope' or game.server:
+            # (with launcher direct the display is the desktop: the pointer of the person at it would move)
+            raise RuntimeError('input needs a client launched with launcher gamescope')
+        if not game.running():
+            raise RuntimeError('%s is not running; use launch first' % game.label())
+        self.x11, self.xtst, _ = xlib()
+        env = game_environ(game)
+        if env.get('XAUTHORITY'):
+            os.environ['XAUTHORITY'] = env['XAUTHORITY']
+        self.display = env['DISPLAY']
+        self.dpy = self.x11.XOpenDisplay(self.display.encode())
+        if not self.dpy:
+            raise RuntimeError('could not open the X display %s of the game' % self.display)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.x11.XCloseDisplay(self.dpy)
+
+    def sync(self, pause=0.0):
+        self.x11.XSync(self.dpy, 0)
+        if pause:
+            time.sleep(pause)
+
+    def move(self, dx, dy, step=40):
+        """Relative motion in steps: SDL's relative mode puts the pointer back in the middle after every event; one
+        big jump would stop at the edge of the screen."""
+        while dx or dy:
+            sx, sy = max(-step, min(step, dx)), max(-step, min(step, dy))
+            self.xtst.XTestFakeRelativeMotionEvent(self.dpy, sx, sy, 0)
+            self.sync(0.012)
+            dx, dy = dx - sx, dy - sy
+
+    def button(self, number, down):
+        self.xtst.XTestFakeButtonEvent(self.dpy, number, 1 if down else 0, 0)
+        self.sync(0.03)
+
+    def keycode(self, keysym):
+        code = self.x11.XKeysymToKeycode(self.dpy, keysym)
+        if not code:
+            raise RuntimeError('the keyboard map of %s has no key for keysym 0x%x' % (self.display, keysym))
+        # (a character on the second level of its key needs shift, e.g. upper case or "!")
+        return code, self.x11.XkbKeycodeToKeysym(self.dpy, code, 0, 0) != keysym
+
+    def keysym(self, name):
+        if len(name) == 1:
+            # (Latin-1 characters are their own keysyms; the names of the others, e.g. "a", "1", work too)
+            return ord(name) if ord(name) < 256 else 0x01000000 + ord(name)
+        n = XKEYS.get(name.lower()) or (name.upper() if re.match(r'(?i)f\d{1,2}$', name) else name)
+        sym = self.x11.XStringToKeysym(n.encode())
+        if not sym:
+            raise RuntimeError('unknown key %r; use one character, f1-f12, an X keysym name or one of %s'
+                               % (name, ', '.join(sorted(XKEYS))))
+        return sym
+
+    def key(self, combo):
+        """A key with modifiers held around it, e.g. "ctrl+v", "shift+tab", "enter", "A"."""
+        parts = combo.split('+') if combo != '+' else ['+']
+        if parts[-1] == '' and len(parts) > 1:
+            parts = parts[:-2] + ['+']      # ("ctrl++")
+        mods = [self.keycode(self.keysym(m))[0] for m in parts[:-1]]
+        code, shift = self.keycode(self.keysym(parts[-1]))
+        if shift:
+            mods.append(self.keycode(self.keysym('shift'))[0])
+        for m in mods:
+            self.xtst.XTestFakeKeyEvent(self.dpy, m, 1, 0)
+        self.sync(0.02)
+        self.xtst.XTestFakeKeyEvent(self.dpy, code, 1, 0)
+        self.sync(0.03)
+        self.xtst.XTestFakeKeyEvent(self.dpy, code, 0, 0)
+        self.sync(0.02)
+        for m in reversed(mods):
+            self.xtst.XTestFakeKeyEvent(self.dpy, m, 0, 0)
+        self.sync(0.02)
+
+
+def pointer_to(game, xi, x, y, home, step_px):
+    """The pointer of the window to window pixel x, y. The cgame and the ui keep it in 640x480 units (wider windows
+    add a margin left and right) and take the raw motion of the mouse: one X pixel is one unit, so a unit is
+    min(width/640, height/480) window pixels. home first runs it into the top left corner, where it stops."""
+    w, h = game.size
+    scale = float(step_px) if step_px else min(w / 640.0, h / 480.0)
+    if home or game.pointer is None:
+        xi.move(-int(w / scale) - 20, -int(h / scale) - 20)
+        game.pointer = (0, 0)
+    tx, ty = int(round(x / scale)), int(round(y / scale))
+    xi.move(tx - game.pointer[0], ty - game.pointer[1])
+    game.pointer = (tx, ty)
+    return tx * scale, ty * scale
 
 
 # ---- the tools
@@ -658,6 +957,8 @@ SHOT = {'screenshot': {'type': 'boolean', 'default': False, 'description': 'also
 FRAME = {'crop': {'type': 'array', 'items': {'type': 'number'}, 'description': '[x, y, w, h] in window pixels'},
          'around': {'type': 'array', 'items': {'type': 'number'}, 'description': '[x, y, z]: a point of the level to frame'},
          'size': {'type': 'array', 'items': {'type': 'number'}, 'description': '[w, h] of the frame around the point', 'default': [400, 300]},
+         'extent': {'type': 'number', 'description': 'instead of size: half the size in world units of a box around the point; '
+                                                     'the frame is that box as large as it is on the window (full resolution)'},
          'zoom': {'type': 'number', 'default': 1}}
 RO = {'readOnlyHint': True, 'openWorldHint': False}
 ACT = {'readOnlyHint': False, 'destructiveHint': False, 'openWorldHint': False}
@@ -703,16 +1004,21 @@ TOOLS = [
                                 timeout=P(type='number', default=60), server=P(type='boolean', default=False)), ['kind']),
      'annotations': ACT},
     {'name': 'screenshot', 'title': 'Screenshot',
-     'description': 'Picture of the window now, as JPEG. crop [x,y,w,h] or around a point of the level [x,y,z] (size [w,h]), '
-                    'zoom, max_width (0: full size). Returns an id for compare. Pixel coordinates always refer to the full window.',
-     'inputSchema': schema(dict(CLIENT, max_width=P(type='integer', default=1280), quality=P(type='integer', default=85), **FRAME)),
+     'description': 'Picture of the window now, as JPEG. crop [x,y,w,h] or around a point of the level [x,y,z] (size [w,h] '
+                    'in pixels, or extent in world units for a box around it), zoom, max_width (0: full size), fit (a small '
+                    'frame scaled up to max_width). A frame is cut at full resolution. Returns an id for compare and the '
+                    'frame. Pixel coordinates always refer to the full window.',
+     'inputSchema': schema(dict(CLIENT, max_width=P(type='integer', default=1280), quality=P(type='integer', default=85),
+                                fit=P(type='boolean', default=False), **FRAME)),
      'annotations': RO},
     {'name': 'sequence', 'title': 'Screenshots at game times',
-     'description': 'Several screenshots at game times after now (at_ms, e.g. [0, 100, 250, 500]), side by side in one '
-                    'picture; while they are taken the buttons of hold run if given (e.g. ["+attack"]). crop/around/zoom as '
-                    'for screenshot (around is projected once, at the start).',
-     'inputSchema': schema(dict(CLIENT, at_ms=P(type='array', items=P(type='integer')), hold=P(type='array', items=P(type='string')),
-                                max_width=P(type='integer', default=1600), **FRAME), ['at_ms']),
+     'description': 'Several screenshots at game times after now (at_ms, also called times, e.g. [0, 100, 250, 500]), side by '
+                    'side in one picture; while they are taken the buttons of hold run if given (e.g. ["+attack"]). '
+                    'crop/around/extent/zoom as for screenshot (around is projected once, at the start).',
+     'inputSchema': schema(dict(CLIENT, at_ms=P(type='array', items=P(type='integer'), description='game times in ms after now'),
+                                times=P(type='array', items=P(type='integer'), description='the same as at_ms'),
+                                hold=P(type='array', items=P(type='string')),
+                                max_width=P(type='integer', default=1600), **FRAME)),
      'annotations': ACT},
     {'name': 'compare', 'title': 'Two screenshots side by side',
      'description': 'Two screenshots of this session (ids from screenshot or sequence) side by side, cropped the same if crop is given.',
@@ -761,6 +1067,20 @@ TOOLS = [
                                 action=P(type='string', enum=['move', 'click', 'hold', 'release', 'wheelup', 'wheeldown'], default='move'),
                                 **SHOT), ['x', 'y']),
      'annotations': ACT},
+    {'name': 'input', 'title': 'Real mouse and keys',
+     'description': 'Real input through the X display of the client (XTEST), for what mouse and key do not reach: windows of the '
+                    'cgame (VisionJK drawing board, boombox, model browser) and the game itself. x, y: move the pointer to that '
+                    'window pixel (home=true first runs it into the top left corner, so the place is exact; false moves on from '
+                    'the last place of this tool). action there: click, rightclick, hold, release (button 1, or button 1-3), '
+                    'wheelup, wheeldown (count times). key: a key with modifiers, e.g. "enter", "esc", "ctrl+v", "shift+tab", '
+                    '"f1", "A". text: typed character by character. Order: pointer, action, key, text. step_px: window pixels '
+                    'per unit of the pointer if a window does not use 640x480 units (default min(width/640, height/480)).',
+     'inputSchema': schema(dict(CLIENT, x=P(type='number'), y=P(type='number'), home=P(type='boolean', default=True),
+                                action=P(type='string', enum=['move', 'click', 'rightclick', 'hold', 'release', 'wheelup', 'wheeldown'],
+                                         default='move'),
+                                button=P(type='integer', default=1), count=P(type='integer', default=1),
+                                key=P(type='string'), text=P(type='string'), step_px=P(type='number'), **SHOT)),
+     'annotations': ACT},
     {'name': 'click', 'title': 'Click item',
      'description': 'Click the middle of a menu item found by its exact name or text, else the first item whose text contains the words '
                     '(topmost menu first). menu: limit the search to one menu.',
@@ -783,10 +1103,21 @@ TOOLS = [
                     'map=), keeping the cvars named in keep.',
      'inputSchema': schema(dict(CLIENT, keep=P(type='array', items=P(type='string')))),
      'annotations': ACT},
+    {'name': 'configure', 'title': 'Configuration of this session',
+     'description': 'Change the configuration for this MCP server only (every session runs its own; the shared file is not '
+                    'touched, other sessions keep their build). file: another JSON file. replace: {"old path": "new path"} '
+                    'for every path in it at or below the old one, e.g. the main clone by a worktree; game_dir and home need '
+                    'their own replace (or set) so prepare does not fill the folder of another session. set: keys on top '
+                    '(game_dir, home, server_port, prepare, reload, ...; null drops one). reset: back to the file. Without '
+                    'arguments it shows the configuration. No client or server may run. reload and prepare keep it.',
+     'inputSchema': schema(P(file=P(type='string'), replace=P(type='object'), set=P(type='object'),
+                             reset=P(type='boolean', default=False))),
+     'annotations': {'readOnlyHint': False, 'destructiveHint': False, 'idempotentHint': True, 'openWorldHint': False}},
     {'name': 'prepare', 'title': 'Make the test game folder',
      'description': 'Build the game folder of the configuration (game_dir) from prepare.link (symlinks, e.g. the base pk3s) and '
                     'prepare.copy (real copies of the executable, renderers, modules; the engine loads the renderer from next to '
-                    'its real path). Never writes into the source folders. No client may run.',
+                    'its real path). Never writes into the source folders. No client may run, also none of another session '
+                    'from game_dir (configure gives this session a folder of its own).',
      'inputSchema': schema(),
      'annotations': {'readOnlyHint': False, 'destructiveHint': False, 'idempotentHint': True, 'openWorldHint': False}},
     {'name': 'log', 'title': 'Game output',
@@ -1046,6 +1377,10 @@ def prepare(cfg):
         raise RuntimeError('quit the clients and the server first')
     game_dir = os.path.abspath(cfg['game_dir'])
     not_temporary(game_dir, 'game_dir')
+    other = foreign_processes(cwd=game_dir)
+    if other:
+        raise RuntimeError('a game of another session runs from %s (pid %d: %s): prepare would change its build; give '
+                           'this session its own game_dir and home with configure' % ((game_dir,) + other[0]))
     p = cfg.get('prepare') or {}
     sources = [os.path.realpath(entry[0]) for entry in (p.get('link') or [])]
     for s in sources:
@@ -1097,6 +1432,29 @@ def prepare(cfg):
     if gone:
         out.append('removed %d from an earlier prepare: %s' % (len(gone), ', '.join(gone)))
     return 'prepared %s: %s' % (game_dir, ', '.join(out))
+
+
+def config_text(cfg):
+    """What configure shows: where the configuration comes from, what this session changed, the folders and the builds."""
+    out = ['file %s%s' % (config_path(), ' (chosen by configure)' if OVERRIDES['file'] else '')]
+    if OVERRIDES['replace']:
+        out.append('replace ' + json.dumps(OVERRIDES['replace']))
+    if OVERRIDES['set']:
+        out.append('set ' + json.dumps(OVERRIDES['set']))
+    for k in ('game_dir', 'home', 'server_port', 'renderer', 'launcher'):
+        out.append('%s %s' % (k, cfg.get(k)))
+    for src, dst in (cfg.get('prepare') or {}).get('copy') or []:
+        out.append('prepare %s <- %s' % (dst, src))
+    if (cfg.get('reload') or {}).get('cwd'):
+        out.append('reload in %s' % cfg['reload']['cwd'])
+    shared = load_config(own=False)
+    if OVERRIDES['file'] or OVERRIDES['replace'] or OVERRIDES['set']:
+        same = [k for k in ('game_dir', 'home') if shared.get(k) and os.path.realpath(shared[k]) == os.path.realpath(cfg.get(k) or '')]
+        if same and json.dumps(shared.get('prepare'), sort_keys=True) != json.dumps(cfg.get('prepare'), sort_keys=True):
+            out.append('WARNING: %s %s the same as in the shared configuration, but the build is another: prepare would put '
+                       'this build into the folder other sessions test with; replace or set %s too'
+                       % (' and '.join(same), 'are' if len(same) > 1 else 'is', ' and '.join(same)))
+    return '\n'.join(out)
 
 
 def call(cfg, name, a):
@@ -1152,12 +1510,14 @@ def call(cfg, name, a):
         data = g.screenshot()
         sid = keep_shot(data, g.name)
         note = 'screenshot %s' % sid + (' (point at %d,%d)' % p if p else '')
+        if rect:
+            note += ', frame %d,%d %dx%d' % tuple(round(v) for v in rect)
         return [text(note), image_content(data, int(a.get('max_width', 1280)), int(a.get('quality', 85)), rect,
-                                          float(a.get('zoom', 1)))], None
+                                          float(a.get('zoom', 1)), fit=bool(a.get('fit')))], None
     if name == 'sequence':
         g = game_of(cfg, a)
         rect, _ = framing(g, a)
-        at = sorted(int(t) for t in a['at_ms'])
+        at = sorted(int(t) for t in (a.get('at_ms') or a.get('times') or []))
         if not at:
             raise RuntimeError('at_ms is empty: give the game times, e.g. [0, 200, 400]')
         start = g.game_time()
@@ -1290,6 +1650,64 @@ def call(cfg, name, a):
         g.send('v_uiMouse %s %s %s px' % (a['x'], a['y'], action))
         time.sleep(0.15)
         return after(g, a, 'pointer at %s,%s %s' % (a['x'], a['y'], action or 'moved')), None
+    if name == 'input':
+        g = game_of(cfg, a)
+        done = []
+        with XInput(g) as xi:
+            if a.get('x') is not None or a.get('y') is not None:
+                if a.get('x') is None or a.get('y') is None:
+                    raise RuntimeError('give both x and y')
+                px, py = pointer_to(g, xi, float(a['x']), float(a['y']), a.get('home', True), a.get('step_px'))
+                done.append('pointer at %d,%d' % (px, py))
+            action = a.get('action') or 'move'
+            button = 3 if action == 'rightclick' else int(a.get('button', 1))
+            if action in ('click', 'rightclick'):
+                for _ in range(max(1, int(a.get('count', 1)))):
+                    xi.button(button, True)
+                    xi.button(button, False)
+                done.append('clicked button %d' % button)
+            elif action in ('hold', 'release'):
+                xi.button(button, action == 'hold')
+                done.append('%s button %d' % ('holding' if action == 'hold' else 'released', button))
+            elif action in ('wheelup', 'wheeldown'):
+                for _ in range(max(1, int(a.get('count', 1)))):
+                    xi.button(4 if action == 'wheelup' else 5, True)
+                    xi.button(4 if action == 'wheelup' else 5, False)
+                done.append('%s x%d' % (action, max(1, int(a.get('count', 1)))))
+            if a.get('key'):
+                xi.key(a['key'])
+                done.append('key %s' % a['key'])
+            if a.get('text'):
+                for ch in a['text']:
+                    xi.key(ch)
+                done.append('typed %s' % json.dumps(a['text']))
+            display = xi.display
+        time.sleep(0.1)
+        return after(g, a, '%s (X display %s)' % ('; '.join(done) or 'nothing to do', display)), None
+    if name == 'configure':
+        if any(g.running() for g in GAMES.values()):
+            raise RuntimeError('quit the clients and the server first (configure changes their folders)')
+        if a.get('reset'):
+            OVERRIDES.update({'file': None, 'replace': {}, 'set': {}})
+        if a.get('file'):
+            f = os.path.abspath(os.path.expanduser(a['file']))
+            if not os.path.isfile(f):
+                raise RuntimeError('no file %s' % f)
+            OVERRIDES['file'] = f
+        if a.get('replace') is not None:
+            OVERRIDES['replace'] = {os.path.expanduser(k): os.path.expanduser(v) for k, v in (a['replace'] or {}).items()}
+        for k, v in (a.get('set') or {}).items():
+            if v is None:
+                OVERRIDES['set'].pop(k, None)
+            else:
+                OVERRIDES['set'][k] = v
+        fresh = load_config()
+        cfg.clear()
+        cfg.update(fresh)
+        # (the games that do not run made their homes from the old configuration)
+        for k in [k for k, g in GAMES.items() if not g.running()]:
+            del GAMES[k]
+        return [text(config_text(cfg))], None
     if name == 'click':
         g = game_of(cfg, a)
         menu, item = find_item(g, a['item'], a.get('menu'))
