@@ -45,7 +45,7 @@ The server reads the file named by the environment variable `JKA_MCP_CONFIG`. Wi
 | `quiet` | Cvars of a launch without `audio=true`. | `s_volume 0`, `s_musicvolume 0` |
 | `cvars` | Cvars of every client launch. | `con_notifytime 0` |
 | `presets` | Named cvar sets that `launch` can ask for with `preset`. | `msaa8`, `no_spawn_protection` |
-| `renderer` | Value for `cl_renderer`. Empty leaves the choice to the game. | `rd-vulkan-vision` |
+| `renderer` | Value for `cl_renderer`, for other OpenJK based clients. VisionJK has no `cl_renderer` anymore, so leave it empty for VisionJK. | empty |
 | `server_args` | Command line words added to every server start. | `+set sv_pure 0`, `g_gametype 0` |
 | `server_port` | First UDP port the server tries, see `server_launch` below. `connect=localhost` goes to the port the server really got. | `29070` |
 | `prepare` | What the `prepare` tool builds, see below. | both empty |

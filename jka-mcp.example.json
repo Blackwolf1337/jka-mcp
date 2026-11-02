@@ -5,7 +5,7 @@
   "home": "/path/to/jka-mcp-home",
   "fs_game": "japlus",
   "launcher": "gamescope",
-  "renderer": "rd-vulkan-vision",
+  "renderer": "",
   "env": {
     "VK_DRIVER_FILES": "/usr/share/vulkan/icd.d/radeon_icd.json"
   },
@@ -21,7 +21,6 @@
       ["/path/to/visionjk/build64/visionjk.x86_64", "visionjk.x86_64"],
       ["/path/to/visionjk/build64/visionjkded.x86_64", "visionjkded.x86_64"],
       ["/path/to/visionjk/build64/codemp/rd-vulkan-vision/rd-vulkan-vision_x86_64.so", "rd-vulkan-vision_x86_64.so"],
-      ["/path/to/visionjk/build64/codemp/rd-vanilla/rd-vanilla_x86_64.so", "rd-vanilla_x86_64.so"],
       ["/path/to/visionjk/build64/codemp/ui/uix86_64.so", "japlus/uix86_64.so"],
       ["/path/to/visionjk/build64/codemp/cgame/cgamex86_64.so", "japlus/cgamex86_64.so"],
       ["/path/to/visionjk/build64/codemp/game/jampgamex86_64.so", "japlus/jampgamex86_64.so"],
@@ -50,11 +49,10 @@
       ["/path/to/visionjk/build64/codemp/game/jampgamex86_64.so", "japlus/jampgamex86_64.so"]
     ],
     "renderer": [
-      ["cmake", "--build", "build64", "--target", "rd-vulkan-vision_x86_64", "rd-vanilla_x86_64"]
+      ["cmake", "--build", "build64", "--target", "rd-vulkan-vision_x86_64"]
     ],
     "renderer_copy": [
-      ["/path/to/visionjk/build64/codemp/rd-vulkan-vision/rd-vulkan-vision_x86_64.so", "rd-vulkan-vision_x86_64.so"],
-      ["/path/to/visionjk/build64/codemp/rd-vanilla/rd-vanilla_x86_64.so", "rd-vanilla_x86_64.so"]
+      ["/path/to/visionjk/build64/codemp/rd-vulkan-vision/rd-vulkan-vision_x86_64.so", "rd-vulkan-vision_x86_64.so"]
     ],
     "engine": [
       ["cmake", "--build", "build64", "--target", "visionjk.x86_64", "visionjkded.x86_64"]

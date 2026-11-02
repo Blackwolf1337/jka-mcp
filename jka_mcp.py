@@ -62,7 +62,7 @@ CONFIG = {
     'cvars': {'con_notifytime': '0'},
     'server_args': ['+set', 'sv_pure', '0', '+set', 'g_gametype', '0'],
     'server_port': 29070,           # where server_launch starts looking for a free UDP port
-    'renderer': 'rd-vulkan-vision', # cl_renderer, empty: the game's own choice
+    'renderer': '',                 # cl_renderer, empty: the game's own choice (VisionJK has only one)
     'presets': {                    # named sets of cvars a launch can ask for (preset=[...])
         'msaa8': {'r_ext_multisample': '8'},
         'no_spawn_protection': {'g_spawnInvulnerability': '0'},
