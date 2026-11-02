@@ -31,7 +31,7 @@ import sys
 import threading
 import time
 
-VERSION = '0.3.0'
+VERSION = '0.3.1'
 PROTOCOLS = ('2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05')
 
 INSTRUCTIONS = (
@@ -233,6 +233,7 @@ class Game:
         self.audio_pos = 0
         self.port = None            # the UDP port the server really has
         self.pointer = None         # input: where the pointer of the window is, in 640x480 units from the top left
+        self.held_keys = {}         # input: keys key_down pressed and no key_up let go yet
         base = os.path.abspath(cfg['home'])
         self.home = base if name == 'main' and not server else '%s-%s' % (base, 'server' if server else name)
 
@@ -409,6 +410,7 @@ class Game:
         code = self.proc.returncode
         self.proc = None
         self.pointer = None
+        self.held_keys = {}
         if self.log:
             self.log.close()
             self.log = None
@@ -884,6 +886,16 @@ class XInput:
                                % (name, ', '.join(sorted(XKEYS))))
         return sym
 
+    def hold_key(self, game, name, down):
+        """A key pressed and kept down until a later call lets it go (e.g. shift over a drag split across calls)."""
+        code, _ = self.keycode(self.keysym(name))
+        self.xtst.XTestFakeKeyEvent(self.dpy, code, 1 if down else 0, 0)
+        self.sync(0.02)
+        if down:
+            game.held_keys[name.lower()] = code
+        else:
+            game.held_keys.pop(name.lower(), None)
+
     def key(self, combo):
         """A key with modifiers held around it, e.g. "ctrl+v", "shift+tab", "enter", "A"."""
         parts = combo.split('+') if combo != '+' else ['+']
@@ -1073,13 +1085,16 @@ TOOLS = [
                     'window pixel (home=true first runs it into the top left corner, so the place is exact; false moves on from '
                     'the last place of this tool). action there: click, rightclick, hold, release (button 1, or button 1-3), '
                     'wheelup, wheeldown (count times). key: a key with modifiers, e.g. "enter", "esc", "ctrl+v", "shift+tab", '
-                    '"f1", "A". text: typed character by character. Order: pointer, action, key, text. step_px: window pixels '
-                    'per unit of the pointer if a window does not use 640x480 units (default min(width/640, height/480)).',
+                    '"f1", "A". text: typed character by character. key_down: keys pressed and kept down across calls (e.g. '
+                    '["shift"] for a shift drag: key_down with action hold, a move with home=false, key_up with action '
+                    'release); key_up lets them go. Order: key_down, pointer, action, key, text, key_up. step_px: window '
+                    'pixels per unit of the pointer if a window does not use 640x480 units (default min(width/640, height/480)).',
      'inputSchema': schema(dict(CLIENT, x=P(type='number'), y=P(type='number'), home=P(type='boolean', default=True),
                                 action=P(type='string', enum=['move', 'click', 'rightclick', 'hold', 'release', 'wheelup', 'wheeldown'],
                                          default='move'),
                                 button=P(type='integer', default=1), count=P(type='integer', default=1),
-                                key=P(type='string'), text=P(type='string'), step_px=P(type='number'), **SHOT)),
+                                key=P(type='string'), text=P(type='string'), key_down=P(type='array', items=P(type='string')),
+                                key_up=P(type='array', items=P(type='string')), step_px=P(type='number'), **SHOT)),
      'annotations': ACT},
     {'name': 'click', 'title': 'Click item',
      'description': 'Click the middle of a menu item found by its exact name or text, else the first item whose text contains the words '
@@ -1654,6 +1669,9 @@ def call(cfg, name, a):
         g = game_of(cfg, a)
         done = []
         with XInput(g) as xi:
+            for k in a.get('key_down') or []:
+                xi.hold_key(g, k, True)
+                done.append('holding %s' % k)
             if a.get('x') is not None or a.get('y') is not None:
                 if a.get('x') is None or a.get('y') is None:
                     raise RuntimeError('give both x and y')
@@ -1681,7 +1699,12 @@ def call(cfg, name, a):
                 for ch in a['text']:
                     xi.key(ch)
                 done.append('typed %s' % json.dumps(a['text']))
+            for k in a.get('key_up') or []:
+                xi.hold_key(g, k, False)
+                done.append('released %s' % k)
             display = xi.display
+        if g.held_keys:
+            done.append('still held: %s' % ', '.join(sorted(g.held_keys)))
         time.sleep(0.1)
         return after(g, a, '%s (X display %s)' % ('; '.join(done) or 'nothing to do', display)), None
     if name == 'configure':
