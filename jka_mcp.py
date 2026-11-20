@@ -506,12 +506,16 @@ class Game:
         name = 'jkamcp_%d_%s_%d' % (os.getpid(), self.name, self.shot)
         m = self.mark()
         self.send('screenshot_png %s' % name)
-        line = self.wait_for(r'Wrote screenshots/%s\.png' % name, timeout, m)
+        line = self.wait_for(r'Wrote .*screenshots/%s\.png' % name, timeout, m)
         if not line:
             raise RuntimeError('no screenshot was written:\n' + '\n'.join(self.since(m)[-15:]))
-        found = glob.glob(os.path.join(self.home, '*', 'screenshots', name + '.png'))
-        if not found:
-            found = glob.glob(os.path.join(os.path.abspath(self.cfg['game_dir']), '*', 'screenshots', name + '.png'))
+        for _ in range(60):
+            found = glob.glob(os.path.join(self.home, '*', 'screenshots', name + '.png'))
+            if not found:
+                found = glob.glob(os.path.join(os.path.abspath(self.cfg['game_dir']), '*', 'screenshots', name + '.png'))
+            if found:
+                break
+            time.sleep(0.05)
         if not found:
             raise RuntimeError('the game wrote %s.png, but it is not under %s' % (name, self.home))
         with open(found[0], 'rb') as f:
